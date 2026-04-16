@@ -1,0 +1,12 @@
+pandas
+numpy
+scipy
+scikit-learn
+torch
+skorch
+shap
+combat
+pingouin
+tqdm
+umap-learn
+matplotlib
