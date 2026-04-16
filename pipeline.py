@@ -34,6 +34,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.stats import pearsonr
 from sklearn.model_selection import GroupKFold, StratifiedKFold
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.calibration import CalibratedClassifierCV
+from xgboost import XGBClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.metrics import (
@@ -46,7 +49,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from skorch import NeuralNetClassifier
-from skorch.callbacks import LRScheduler
+from skorch.callbacks import LRScheduler, EarlyStopping
+from skorch.dataset import ValidSplit
 import shap
 
 warnings.filterwarnings("ignore")
@@ -54,9 +58,10 @@ warnings.filterwarnings("ignore")
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-DATA_CSV   = os.path.join(os.path.dirname(__file__), "embeddings_and_labels.csv")
-ICC_CSV    = os.path.join(os.path.dirname(__file__), "radiomics.csv")
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "results")
+DATA_CSV              = os.path.join(os.path.dirname(__file__), "embeddings_and_labels.csv")
+ICC_CSV               = os.path.join(os.path.dirname(__file__), "radiomics.csv")
+OUTPUT_DIR            = os.path.join(os.path.dirname(__file__), "results")
+FEATURE_CACHE         = os.path.join(OUTPUT_DIR, "retained_feature_names.txt")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ---------------------------------------------------------------------------
@@ -316,15 +321,16 @@ def pearson_redundancy_reduction(features: pd.DataFrame,
     from random import choice
 
     cols = features.columns.tolist()
-    keep = np.ones(len(cols), dtype=bool)
-
-    for col1, col2 in itertools.combinations(cols, 2):
-        i1, i2 = cols.index(col1), cols.index(col2)
-        if not keep[i1] or not keep[i2]:
+    X    = features.values.astype(float)
+    corr = np.corrcoef(X.T)
+    n    = len(cols)
+    keep = np.ones(n, dtype=bool)
+    for i in range(n):
+        if not keep[i]:
             continue
-        r, p = pearsonr(features[col1], features[col2])
-        if r > threshold and p < p_threshold:
-            keep[choice([i1, i2])] = False
+        drop = np.where(keep & (np.abs(corr[i]) > threshold))[0]
+        drop = drop[drop > i]
+        keep[drop] = False
 
     retained = [c for c, k in zip(cols, keep) if k]
     print(f"Redundancy reduction: {len(retained)} / {len(cols)} features retained")
@@ -401,70 +407,42 @@ class StratifiedGroupKFold:
 
 
 # ---------------------------------------------------------------------------
-# 8. UMAP + Silhouette
+# 8. UMAP + Silhouette — saves embedding data only (no plot)
 # ---------------------------------------------------------------------------
 
-def compute_umap_and_plot(task_name: str, X: np.ndarray, y: np.ndarray,
-                           class_labels: dict):
+def compute_umap_and_save(task_name: str, X: np.ndarray, y: np.ndarray,
+                           class_labels: dict, out_dir: str = None):
+    import json
     from umap import UMAP
 
     print(f"  Computing UMAP for {task_name}...")
-    reducer   = UMAP(n_neighbors=30, min_dist=0.5, n_components=2,
+    reducer   = UMAP(n_neighbors=10, min_dist=0.1, n_components=2,
                      random_state=42, n_jobs=1)
     embedding = reducer.fit_transform(X)
 
     sil = silhouette_score(embedding, y)
     print(f"  Silhouette score (UMAP space): {sil:.4f}")
 
-    fig, ax = plt.subplots(figsize=(6, 5))
-    colors = plt.cm.tab10.colors
-    for cls, label in class_labels.items():
-        mask = y == cls
-        ax.scatter(embedding[mask, 0], embedding[mask, 1],
-                   c=[colors[cls % 10]], label=label, alpha=0.6, s=14, linewidths=0)
-    ax.set_title(f"UMAP — {task_name}\nSilhouette: {sil:.3f}")
-    ax.set_xlabel("UMAP 1")
-    ax.set_ylabel("UMAP 2")
-    ax.legend(fontsize=8, markerscale=2)
-    fig.tight_layout()
-    path = os.path.join(OUTPUT_DIR, f"{task_name}_umap.png")
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    print(f"  UMAP plot saved to {path}")
+    _out = out_dir or OUTPUT_DIR
+    pd.DataFrame({"umap1": embedding[:, 0], "umap2": embedding[:, 1],
+                  "label": y}).to_csv(
+        os.path.join(_out, f"{task_name}_umap_embedding.csv"), index=False)
 
+    with open(os.path.join(_out, f"{task_name}_umap_meta.json"), "w") as f:
+        json.dump({"silhouette": sil,
+                   "class_labels": {str(k): v for k, v in class_labels.items()}}, f)
+    print(f"  UMAP embedding saved to {_out}")
     return embedding, sil
 
 
 # ---------------------------------------------------------------------------
-# 9. SHAP on manuscript features
+# 9. SHAP — saves top-5 data only (no plot)
 # ---------------------------------------------------------------------------
 
-def compute_shap_and_plot(task_name: str, model, scaler, X_bg: np.ndarray,
+def compute_shap_and_save(task_name: str, model, scaler, X_bg: np.ndarray,
                            X_explain: np.ndarray, y_explain: np.ndarray,
-                           feature_names: list, device: str):
-    ms_specs = MANUSCRIPT_SHAP_FEATURES.get(task_name)
-    if ms_specs is None:
-        print(f"  No manuscript SHAP features defined for {task_name}; skipping.")
-        return
-
-    # Resolve which column survived redundancy reduction
-    resolved = []
-    for prefix, suffix in ms_specs:
-        col = resolve_feature(prefix, suffix, feature_names)
-        if col is not None:
-            resolved.append(col)
-        else:
-            print(f"  WARNING: manuscript feature ({prefix}, {suffix}) not found in retained set")
-
-    if not resolved:
-        print(f"  No manuscript features found for {task_name}; skipping SHAP.")
-        return
-
-    print(f"  Running SHAP for {task_name} on {len(resolved)} manuscript features:")
-    for col in resolved:
-        print(f"    {col}")
-
-    feat_idx = [feature_names.index(c) for c in resolved]
+                           feature_names: list, device: str, out_dir: str = None):
+    print(f"  Running SHAP for {task_name} on all {len(feature_names)} features...")
 
     model.eval()
 
@@ -473,97 +451,136 @@ def compute_shap_and_plot(task_name: str, model, scaler, X_bg: np.ndarray,
             t = torch.tensor(x, dtype=torch.float32).to(device)
             return F.softmax(model(t), dim=1).cpu().numpy()
 
-    explainer  = shap.KernelExplainer(predict_fn, X_bg)
-    shap_vals  = explainer.shap_values(X_explain, nsamples=100)
+    explainer = shap.KernelExplainer(predict_fn, X_bg)
+    shap_vals = explainer.shap_values(X_explain, nsamples=100)
 
-    # Extract class-1 SHAP values; handle both output formats of KernelExplainer:
-    #   list of arrays  -> list[n_classes], each (n_samples, n_features)
-    #   3-D numpy array -> (n_samples, n_features, n_classes)   [newer SHAP]
     if isinstance(shap_vals, list):
         sv_class1 = shap_vals[1]
     elif isinstance(shap_vals, np.ndarray) and shap_vals.ndim == 3:
         sv_class1 = shap_vals[:, :, 1]
     else:
         sv_class1 = shap_vals
-    sv_subset  = sv_class1[:, feat_idx]
-    X_subset   = X_explain[:, feat_idx]
 
-    # Beeswarm / summary plot
-    fig, ax = plt.subplots(figsize=(8, max(3, len(resolved) * 0.55)))
-    shap.summary_plot(
-        sv_subset, X_subset,
-        feature_names=resolved,
-        show=False, plot_type="dot",
-        color_bar=True,
-    )
-    plt.title(f"SHAP — {task_name}")
-    plt.tight_layout()
-    path = os.path.join(OUTPUT_DIR, f"{task_name}_shap.png")
-    plt.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"  SHAP plot saved to {path}")
+    mean_abs  = np.abs(sv_class1).mean(axis=0)
+    top5_idx  = np.argsort(mean_abs)[::-1][:5]
+    top5_names = [feature_names[i] for i in top5_idx]
 
-    # Save SHAP values for manuscript features to CSV
-    df_shap = pd.DataFrame(sv_subset, columns=resolved)
+    print(f"  Top 5 SHAP features:")
+    for name, idx in zip(top5_names, top5_idx):
+        print(f"    {name}  (mean |SHAP| = {mean_abs[idx]:.4f})")
+
+    _out = out_dir or OUTPUT_DIR
+
+    # SHAP values for top-5 features
+    df_shap = pd.DataFrame(sv_class1[:, top5_idx], columns=top5_names)
     df_shap["true_label"] = y_explain
-    df_shap.to_csv(os.path.join(OUTPUT_DIR, f"{task_name}_shap_values.csv"), index=False)
+    df_shap.to_csv(os.path.join(_out, f"{task_name}_shap_values.csv"), index=False)
+
+    # Actual feature values for top-5 (needed for beeswarm colouring)
+    df_feat = pd.DataFrame(X_explain[:, top5_idx], columns=top5_names)
+    df_feat.to_csv(os.path.join(_out, f"{task_name}_shap_feature_values.csv"), index=False)
+
+    # Ranked feature list
+    pd.DataFrame({"rank": range(1, 6), "feature": top5_names,
+                  "mean_abs_shap": mean_abs[top5_idx]}).to_csv(
+        os.path.join(_out, f"{task_name}_shap_top5.csv"), index=False)
+    print(f"  SHAP data saved to {_out}")
+
+
+def compute_shap_rf_and_save(task_name: str, rf_model,
+                              X_explain: np.ndarray, y_explain: np.ndarray,
+                              feature_names: list, out_dir: str = None):
+    print(f"  Running SHAP (RF) for {task_name}...")
+    explainer = shap.TreeExplainer(rf_model)
+    shap_vals = explainer.shap_values(X_explain)
+
+    if isinstance(shap_vals, list):
+        sv_class1 = shap_vals[1]
+    elif isinstance(shap_vals, np.ndarray) and shap_vals.ndim == 3:
+        sv_class1 = shap_vals[:, :, 1]
+    else:
+        sv_class1 = shap_vals
+
+    mean_abs   = np.abs(sv_class1).mean(axis=0)
+    top5_idx   = np.argsort(mean_abs)[::-1][:5]
+    top5_names = [feature_names[i] for i in top5_idx]
+
+    print(f"  Top 5 SHAP features (RF):")
+    for name, idx in zip(top5_names, top5_idx):
+        print(f"    {name}  (mean |SHAP| = {mean_abs[idx]:.4f})")
+
+    _out = out_dir or OUTPUT_DIR
+    df_shap = pd.DataFrame(sv_class1[:, top5_idx], columns=top5_names)
+    df_shap["true_label"] = y_explain
+    df_shap.to_csv(os.path.join(_out, f"{task_name}_rf_shap_values.csv"), index=False)
+
+    df_feat = pd.DataFrame(X_explain[:, top5_idx], columns=top5_names)
+    df_feat.to_csv(os.path.join(_out, f"{task_name}_rf_shap_feature_values.csv"), index=False)
+
+    pd.DataFrame({"rank": range(1, 6), "feature": top5_names,
+                  "mean_abs_shap": mean_abs[top5_idx]}).to_csv(
+        os.path.join(_out, f"{task_name}_rf_shap_top5.csv"), index=False)
+    print(f"  RF SHAP data saved to {_out}")
 
 
 # ---------------------------------------------------------------------------
-# 10. Probability distribution plot + Jensen-Shannon divergence
+# 10. Probability data + JSD — saves data only (no plot)
 # ---------------------------------------------------------------------------
 
-def plot_probability_distribution(task_name: str, probs: np.ndarray,
-                                   targets: np.ndarray, class_labels: dict) -> float:
-    """
-    Overlapping histogram of predicted class-1 probability, split by true class.
-    Computes Jensen-Shannon divergence between the two class distributions.
-    Returns the JSD value.
-    """
-    n_bins = 20
+def save_probability_data(task_name: str, probs: np.ndarray,
+                           targets: np.ndarray, class_labels: dict,
+                           out_dir: str = None) -> float:
+    n_bins    = 20
     bin_edges = np.linspace(0, 1, n_bins + 1)
-
-    # Build a normalised probability density for each class over the same bins
-    class_probs = {}
+    class_hist = {}
     for cls in sorted(class_labels.keys()):
-        vals = probs[targets == cls]
+        vals   = probs[targets == cls]
         counts, _ = np.histogram(vals, bins=bin_edges, density=False)
-        # Convert to a proper probability vector (sums to 1)
-        total = counts.sum()
-        class_probs[cls] = counts / total if total > 0 else counts + 1e-10
+        total  = counts.sum()
+        class_hist[cls] = counts / total if total > 0 else counts + 1e-10
 
-    # Jensen-Shannon divergence between class 0 and class 1 distributions
-    p = class_probs[0]
-    q = class_probs[1]
-    # jensenshannon returns the distance (sqrt of divergence); square to get JSD
-    jsd = jensenshannon(p, q, base=2) ** 2
-    print(f"  Jensen-Shannon divergence (class distributions): {jsd:.4f}")
+    jsd = jensenshannon(class_hist[0], class_hist[1], base=2) ** 2
+    print(f"  Jensen-Shannon divergence: {jsd:.4f}")
 
-    # Plot
-    colors = ["#e07070", "#6fa8d6"]   # red-ish for class 0, blue for class 1
-    fig, ax = plt.subplots(figsize=(6, 4))
-    for cls, color in zip(sorted(class_labels.keys()), colors):
-        vals  = probs[targets == cls]
-        label = class_labels[cls]
-        ax.hist(vals, bins=bin_edges, alpha=0.55, color=color,
-                label=label, density=True, edgecolor="none")
+    _out = out_dir or OUTPUT_DIR
+    pd.DataFrame({"prob_class1": probs, "true_label": targets}).to_csv(
+        os.path.join(_out, f"{task_name}_val_probs.csv"), index=False)
 
-    ax.set_xlabel("Predicted probability (class 1)")
-    ax.set_ylabel("Density")
-    ax.set_title(f"Predicted probability distribution — {task_name}\nJSD = {jsd:.3f}")
-    ax.legend(fontsize=9)
-    ax.set_xlim(0, 1)
-    fig.tight_layout()
-    path = os.path.join(OUTPUT_DIR, f"{task_name}_prob_dist.png")
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    print(f"  Probability distribution plot saved to {path}")
-
+    import json
+    with open(os.path.join(_out, f"{task_name}_prob_meta.json"), "w") as f:
+        json.dump({"jsd": jsd,
+                   "class_labels": {str(k): v for k, v in class_labels.items()}}, f)
     return jsd
 
 
 # ---------------------------------------------------------------------------
-# 12. Run one classification task
+# 12. Bootstrap confidence intervals
+# ---------------------------------------------------------------------------
+
+def bootstrap_ci(probs: np.ndarray, targets: np.ndarray,
+                 n_boot: int = 2000, ci: float = 0.95,
+                 threshold: float = 0.5, seed: int = 42) -> dict:
+    rng = np.random.default_rng(seed)
+    n = len(targets)
+    stats = {"auc": [], "accuracy": [], "f1": [], "precision": [], "recall": []}
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, size=n)
+        p, t = probs[idx], targets[idx]
+        if len(np.unique(t)) < 2:
+            continue
+        preds = (p >= threshold).astype(int)
+        stats["auc"].append(roc_auc_score(t, p))
+        stats["accuracy"].append(accuracy_score(t, preds))
+        stats["f1"].append(f1_score(t, preds, average="weighted", zero_division=0))
+        stats["precision"].append(precision_score(t, preds, average="weighted", zero_division=0))
+        stats["recall"].append(recall_score(t, preds, average="weighted", zero_division=0))
+    alpha = (1 - ci) / 2
+    return {k: (np.quantile(v, alpha), np.quantile(v, 1 - alpha))
+            for k, v in stats.items() if v}
+
+
+# ---------------------------------------------------------------------------
+# 13. Run one classification task
 # ---------------------------------------------------------------------------
 
 def run_task(
@@ -573,12 +590,12 @@ def run_task(
     patient_ids: np.ndarray,
     batches: np.ndarray,
     class_labels: dict = None,
-    hidden_dim: int = 256,
-    num_epochs: int = 10,
+    hidden_dim: int = 128,
+    num_epochs: int = 100,
     batch_size: int = 16,
     learning_rate: float = 1e-3,
-    weight_decay: float = 1e-3,
-    dropout_rate: float = 0.1,
+    weight_decay: float = 1e-2,
+    dropout_rate: float = 0.4,
     gamma: float = 0.9,
     stratified: bool = False,
     threshold: float = 0.5,
@@ -591,6 +608,9 @@ def run_task(
 
     if class_labels is None:
         class_labels = {int(u): str(u) for u in unique}
+
+    task_dir = os.path.join(OUTPUT_DIR, task_name)
+    os.makedirs(task_dir, exist_ok=True)
 
     from sklearn.feature_selection import VarianceThreshold as VT
 
@@ -608,18 +628,17 @@ def run_task(
         else GroupKFold(n_splits=5)
     )
 
-    metrics_rows    = []
-    all_val_probs   = []
-    all_val_targets = []
-    roc_curves      = []
+    metrics_mlp, metrics_rf, metrics_xgb = [], [], []
+    probs_mlp,   probs_rf,   probs_xgb  = [], [], []
+    targets_all                          = []
+    roc_mlp,     roc_rf,     roc_xgb    = [], [], []
 
-    # State captured from last fold for UMAP and SHAP
     last: dict = {}
 
     for fold, (train_idx, val_idx) in enumerate(splitter.split(X_raw, y, patient_ids)):
         y_tr, y_va = y[train_idx], y[val_idx]
 
-        # 1. Log transform (deterministic — no leakage — applied identically to both splits)
+        # 1. Log transform
         X_tr_log = sign_log_transform_arr(X_raw[train_idx])
         X_va_log = sign_log_transform_arr(X_raw[val_idx])
 
@@ -631,17 +650,13 @@ def run_task(
 
         # 3. Batch correction — fit on train, transform val
         bc = BatchCorrector()
-        X_tr_bc = bc.fit_transform(X_tr_vt, batches[train_idx])
-        X_va_bc = bc.transform(X_va_vt, batches[val_idx])
+        X_tr = bc.fit_transform(X_tr_vt, batches[train_idx]).astype(np.float32)
+        X_va = bc.transform(X_va_vt, batches[val_idx]).astype(np.float32)
 
-        # 4. Pearson redundancy reduction — fit on train
-        feat_mask = pearson_feature_mask(X_tr_bc)
-        X_tr = X_tr_bc[:, feat_mask].astype(np.float32)
-        X_va = X_va_bc[:, feat_mask].astype(np.float32)
-        feat_names = [vt_names[i] for i, k in enumerate(feat_mask) if k]
+        feat_names = vt_names
         input_dim  = X_tr.shape[1]
-        print(f"  Fold {fold+1}: {input_dim} features after preprocessing")
 
+        # ---- MLP ----
         net = NeuralNetClassifier(
             module=MLP,
             module__input_dim=input_dim,
@@ -655,82 +670,154 @@ def run_task(
             optimizer__weight_decay=weight_decay,
             criterion=nn.CrossEntropyLoss,
             device=device,
-            callbacks=[("lr_scheduler", LRScheduler(policy="ExponentialLR", gamma=gamma))],
-            train_split=None,
+            callbacks=[
+                ("lr_scheduler", LRScheduler(policy="ExponentialLR", gamma=gamma)),
+                ("early_stopping", EarlyStopping(monitor="valid_loss", patience=10, lower_is_better=True)),
+            ],
+            train_split=ValidSplit(0.1, stratified=True),
             verbose=0,
         )
-        pipe = Pipeline([("scaler", StandardScaler()), ("net", net)])
-        pipe.fit(X_tr, y_tr)
+        pipe_mlp = Pipeline([("scaler", StandardScaler()), ("net", net)])
+        pipe_mlp.fit(X_tr, y_tr)
 
-        val_probs = pipe.predict_proba(X_va)
-        val_preds = (val_probs[:, 1] >= threshold).astype(int)
-
-        val_auc  = roc_auc_score(y_va, val_probs[:, 1])
-        val_acc  = accuracy_score(y_va, val_preds)
-        val_f1   = f1_score(y_va, val_preds, average="weighted", zero_division=0)
-        val_prec = precision_score(y_va, val_preds, average="weighted", zero_division=0)
-        val_rec  = recall_score(y_va, val_preds, average="weighted", zero_division=0)
-
-        fpr, tpr, _ = roc_curve(y_va, val_probs[:, 1])
-        roc_curves.append((fpr, tpr))
-
-        all_val_probs.append(val_probs[:, 1])
-        all_val_targets.append(y_va)
-
-        metrics_rows.append({
+        vp_mlp  = pipe_mlp.predict_proba(X_va)
+        pd_mlp  = (vp_mlp[:, 1] >= threshold).astype(int)
+        fpr_m, tpr_m, _ = roc_curve(y_va, vp_mlp[:, 1])
+        roc_mlp.append((fpr_m, tpr_m))
+        probs_mlp.append(vp_mlp[:, 1])
+        metrics_mlp.append({
             "fold": fold + 1,
-            "val_auc": val_auc,
-            "val_accuracy": val_acc,
-            "val_f1": val_f1,
-            "val_precision": val_prec,
-            "val_recall": val_rec,
+            "val_auc":       roc_auc_score(y_va, vp_mlp[:, 1]),
+            "val_accuracy":  accuracy_score(y_va, pd_mlp),
+            "val_f1":        f1_score(y_va, pd_mlp, average="weighted", zero_division=0),
+            "val_precision": precision_score(y_va, pd_mlp, average="weighted", zero_division=0),
+            "val_recall":    recall_score(y_va, pd_mlp, average="weighted", zero_division=0),
         })
-        print(f"  Fold {fold+1}: AUC={val_auc:.3f}  Acc={val_acc:.3f}")
 
-        last = dict(pipe=pipe, vt=vt, bc=bc, feat_mask=feat_mask,
+        # ---- Random Forest ----
+        pipe_rf = Pipeline([
+            ("scaler", StandardScaler()),
+            ("rf", RandomForestClassifier(n_estimators=500, random_state=42, n_jobs=-1)),
+        ])
+        pipe_rf.fit(X_tr, y_tr)
+
+        vp_rf  = pipe_rf.predict_proba(X_va)
+        pd_rf  = (vp_rf[:, 1] >= threshold).astype(int)
+        fpr_r, tpr_r, _ = roc_curve(y_va, vp_rf[:, 1])
+        roc_rf.append((fpr_r, tpr_r))
+        probs_rf.append(vp_rf[:, 1])
+        metrics_rf.append({
+            "fold": fold + 1,
+            "val_auc":       roc_auc_score(y_va, vp_rf[:, 1]),
+            "val_accuracy":  accuracy_score(y_va, pd_rf),
+            "val_f1":        f1_score(y_va, pd_rf, average="weighted", zero_division=0),
+            "val_precision": precision_score(y_va, pd_rf, average="weighted", zero_division=0),
+            "val_recall":    recall_score(y_va, pd_rf, average="weighted", zero_division=0),
+        })
+
+        # ---- XGBoost ----
+        n_pos = y_tr.sum()
+        n_neg = len(y_tr) - n_pos
+        spw   = n_neg / n_pos if n_pos > 0 else 1.0
+        xgb   = XGBClassifier(
+            n_estimators=500, learning_rate=0.05, max_depth=4,
+            subsample=0.8, colsample_bytree=0.8,
+            scale_pos_weight=spw,
+            eval_metric="logloss", random_state=42,
+            n_jobs=-1, verbosity=0,
+        )
+        pipe_xgb = Pipeline([("scaler", StandardScaler()), ("xgb", xgb)])
+        pipe_xgb.fit(X_tr, y_tr)
+
+        vp_xgb  = pipe_xgb.predict_proba(X_va)
+        pd_xgb  = (vp_xgb[:, 1] >= threshold).astype(int)
+        fpr_x, tpr_x, _ = roc_curve(y_va, vp_xgb[:, 1])
+        roc_xgb.append((fpr_x, tpr_x))
+        probs_xgb.append(vp_xgb[:, 1])
+        metrics_xgb.append({
+            "fold": fold + 1,
+            "val_auc":       roc_auc_score(y_va, vp_xgb[:, 1]),
+            "val_accuracy":  accuracy_score(y_va, pd_xgb),
+            "val_f1":        f1_score(y_va, pd_xgb, average="weighted", zero_division=0),
+            "val_precision": precision_score(y_va, pd_xgb, average="weighted", zero_division=0),
+            "val_recall":    recall_score(y_va, pd_xgb, average="weighted", zero_division=0),
+        })
+
+        targets_all.append(y_va)
+        print(f"  Fold {fold+1}: MLP AUC={metrics_mlp[-1]['val_auc']:.3f}  RF AUC={metrics_rf[-1]['val_auc']:.3f}  XGB AUC={metrics_xgb[-1]['val_auc']:.3f}")
+
+        last = dict(pipe_mlp=pipe_mlp, pipe_rf=pipe_rf, pipe_xgb=pipe_xgb, vt=vt, bc=bc,
                     feat_names=feat_names, train_idx=train_idx, val_idx=val_idx,
                     X_tr=X_tr, X_va=X_va)
 
-    summary  = pd.DataFrame(metrics_rows)
-    mean_row = summary.mean(numeric_only=True)
-    std_row  = summary.std(numeric_only=True)
-    print(f"\n  Mean AUC: {mean_row['val_auc']:.3f} ± {std_row['val_auc']:.3f}")
+    def _save_model_results(tag, metrics_rows, val_probs_list, roc_curves):
+        df = pd.DataFrame(metrics_rows)
+        m, s = df.mean(numeric_only=True), df.std(numeric_only=True)
+        print(f"\n  [{tag}] Mean AUC: {m['val_auc']:.3f} ± {s['val_auc']:.3f}")
+        df.to_csv(os.path.join(task_dir, f"{task_name}_{tag}_metrics.csv"), index=False)
 
-    out_path = os.path.join(OUTPUT_DIR, f"{task_name}_metrics.csv")
-    summary.to_csv(out_path, index=False)
+        probs_cat   = np.concatenate(val_probs_list)
+        targets_cat = np.concatenate(targets_all)
 
-    # --- Probability distribution + JSD ---
-    val_probs_cat   = np.concatenate(all_val_probs)
-    val_targets_cat = np.concatenate(all_val_targets)
-    jsd = plot_probability_distribution(task_name, val_probs_cat, val_targets_cat, class_labels)
-    summary["jsd"] = jsd
+        ci_dict = bootstrap_ci(probs_cat, targets_cat, threshold=threshold)
+        print(f"  [{tag}] AUC 95% CI: [{ci_dict['auc'][0]:.3f}, {ci_dict['auc'][1]:.3f}]")
+        pd.DataFrame([{"metric": k, "ci_lower": v[0], "ci_upper": v[1]}
+                      for k, v in ci_dict.items()]).to_csv(
+            os.path.join(task_dir, f"{task_name}_{tag}_bootstrap_ci.csv"), index=False)
 
-    # --- UMAP: apply last fold's preprocessing to full task subset ---
+        save_probability_data(f"{task_name}_{tag}", probs_cat, targets_cat, class_labels, out_dir=task_dir)
+
+        fpr_grid = np.linspace(0, 1, 100)
+        roc_rows = []
+        for fold_i, (fpr, tpr) in enumerate(roc_curves):
+            for f, t in zip(fpr_grid, np.interp(fpr_grid, fpr, tpr)):
+                roc_rows.append({"fold": fold_i + 1, "fpr": f, "tpr": t})
+        pd.DataFrame(roc_rows).to_csv(
+            os.path.join(task_dir, f"{task_name}_{tag}_roc_curves.csv"), index=False)
+        return df
+
+    summary_mlp = _save_model_results("mlp", metrics_mlp, probs_mlp, roc_mlp)
+    summary_rf  = _save_model_results("rf",  metrics_rf,  probs_rf,  roc_rf)
+    summary_xgb = _save_model_results("xgb", metrics_xgb, probs_xgb, roc_xgb)
+
+    # --- UMAP (model-independent, use last fold preprocessing) ---
     if last:
         X_full_log = sign_log_transform_arr(X_raw)
         X_full_vt  = last["vt"].transform(X_full_log)
-        X_full_bc  = last["bc"].transform(X_full_vt, batches)
-        X_full     = X_full_bc[:, last["feat_mask"]].astype(np.float32)
-        compute_umap_and_plot(task_name, X_full, y, class_labels)
+        X_full     = last["bc"].transform(X_full_vt, batches).astype(np.float32)
+        compute_umap_and_save(task_name, X_full, y, class_labels, out_dir=task_dir)
 
-    # --- SHAP on manuscript features (last fold model) ---
-    if last and task_name in MANUSCRIPT_SHAP_FEATURES:
-        pipe       = last["pipe"]
-        scaler     = pipe.named_steps["scaler"]
-        model      = pipe.named_steps["net"].module_
+    # --- SHAP (last fold models) ---
+    if last:
         feat_names = last["feat_names"]
-        X_tr_sc    = scaler.transform(last["X_tr"]).astype(np.float32)
-        X_va_sc    = scaler.transform(last["X_va"]).astype(np.float32)
-        bg         = X_tr_sc[np.random.choice(len(X_tr_sc), min(200, len(X_tr_sc)),
-                                               replace=False)]
-        compute_shap_and_plot(task_name, model, scaler, bg, X_va_sc,
-                               y[last["val_idx"]], feat_names, device)
+
+        # MLP SHAP
+        scaler  = last["pipe_mlp"].named_steps["scaler"]
+        model   = last["pipe_mlp"].named_steps["net"].module_
+        X_tr_sc = scaler.transform(last["X_tr"]).astype(np.float32)
+        X_va_sc = scaler.transform(last["X_va"]).astype(np.float32)
+        bg      = X_tr_sc[np.random.choice(len(X_tr_sc), min(200, len(X_tr_sc)), replace=False)]
+        compute_shap_and_save(task_name, model, scaler, bg, X_va_sc,
+                              y[last["val_idx"]], feat_names, device, out_dir=task_dir)
+
+        # RF SHAP
+        scaler_rf = last["pipe_rf"].named_steps["scaler"]
+        rf_model  = last["pipe_rf"].named_steps["rf"]
+        X_va_rf   = scaler_rf.transform(last["X_va"]).astype(np.float32)
+        compute_shap_rf_and_save(task_name, rf_model, X_va_rf,
+                                 y[last["val_idx"]], feat_names, out_dir=task_dir)
+
+        # XGBoost SHAP (reuse RF SHAP function — TreeExplainer supports XGBoost)
+        scaler_xgb = last["pipe_xgb"].named_steps["scaler"]
+        xgb_model  = last["pipe_xgb"].named_steps["xgb"]
+        X_va_xgb   = scaler_xgb.transform(last["X_va"]).astype(np.float32)
+        compute_shap_rf_and_save(f"{task_name}_xgb", xgb_model, X_va_xgb,
+                                 y[last["val_idx"]], feat_names, out_dir=task_dir)
 
     return {
-        "metrics":      summary,
-        "roc_curves":   roc_curves,
-        "val_probs":    np.concatenate(all_val_probs),
-        "val_targets":  np.concatenate(all_val_targets),
+        "metrics_mlp":   summary_mlp,
+        "metrics_rf":    summary_rf,
+        "metrics_xgb":   summary_xgb,
         "feature_names": last.get("feat_names", []),
     }
 
@@ -745,15 +832,30 @@ def main():
     features, meta = load_data(DATA_CSV)
     print(f"Loaded {len(features)} samples, {features.shape[1]} features")
 
-    # --- ICC filtering (global: uses separate reproducibility scan, no leakage) ---
-    if ICC_CSV is not None and os.path.isfile(ICC_CSV):
-        print("Applying ICC feature filtering...")
-        features = icc_filter(features, ICC_CSV)
+    # --- Feature selection: load from cache or compute ICC + Pearson ---
+    if os.path.isfile(FEATURE_CACHE):
+        print(f"Loading retained features from cache: {FEATURE_CACHE}")
+        with open(FEATURE_CACHE) as f:
+            retained_cols = [line.strip() for line in f if line.strip()]
+        retained_cols = [c for c in retained_cols if c in features.columns]
+        features = features[retained_cols]
+        print(f"  {len(retained_cols)} features loaded from cache.")
     else:
-        print("ICC CSV not provided; skipping ICC filtering step.")
+        if ICC_CSV is not None and os.path.isfile(ICC_CSV):
+            print("Applying ICC feature filtering...")
+            features = icc_filter(features, ICC_CSV)
+        else:
+            print("ICC CSV not provided; skipping ICC filtering step.")
 
-    # Log transform, batch correction, and redundancy reduction are performed
-    # inside each CV fold to prevent data leakage from validation samples.
+        print("Running Pearson redundancy reduction (threshold=0.75) on raw features...")
+        features = pearson_redundancy_reduction(features, threshold=0.75)
+
+        with open(FEATURE_CACHE, "w") as f:
+            for col in features.columns:
+                f.write(col + "\n")
+        print(f"  Retained feature names cached to {FEATURE_CACHE}")
+
+    # Log transform and batch correction are performed inside each CV fold.
 
     meta = meta.reset_index(drop=True)
     features = features.reset_index(drop=True)
@@ -791,12 +893,13 @@ def main():
 
     # -----------------------------------------------------------------------
     # Task 3: BRAF V600E status (0=negative, 1=positive)
-    # FTN excluded; includes PTC, FVPTC, PDTC, Oncocytic
+    # Include PTC(0), PDTC(2), Oncocytic(3), FVPTC(4) only.
+    # FTN(1), unknown(-1), and NaN are excluded via explicit include list.
     # -----------------------------------------------------------------------
     mask = (
         mask_valid
         & (meta["tissue"] == "Tu")
-        & (~meta["diagnosis_class"].isin([1, -1]))
+        & meta["diagnosis_class"].isin([0, 2, 3, 4])
         & meta["BRAF p/n"].notna()
     )
     X_t3 = features.loc[mask]
@@ -805,7 +908,7 @@ def main():
     b_t3 = meta.loc[mask, "batch"].values
 
     run_task("braf_v600e", X_t3, y_t3, g_t3, b_t3,
-             class_labels={0: "BRAF-negative", 1: "BRAF-positive"})
+             class_labels={0: "BRAF wild-type", 1: "BRAF mutant"})
 
     # -----------------------------------------------------------------------
     # Task 4: Relapse prediction (0=no relapse, 1=relapse)
