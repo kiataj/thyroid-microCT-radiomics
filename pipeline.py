@@ -195,6 +195,50 @@ def sign_log_transform(features: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def sign_log_transform_arr(X: np.ndarray) -> np.ndarray:
+    return np.sign(X) * np.log1p(np.abs(X))
+
+
+class BatchCorrector:
+    """Per-batch mean/variance correction with fit/transform API."""
+
+    def fit(self, X: np.ndarray, batches: np.ndarray) -> "BatchCorrector":
+        self.grand_mean_ = X.mean(axis=0)
+        gs = X.std(axis=0)
+        self.grand_std_  = np.where(gs > 0, gs, 1.0)
+        self.batch_stats_: dict = {}
+        for b in np.unique(batches):
+            mask = batches == b
+            m = X[mask].mean(axis=0)
+            s = X[mask].std(axis=0)
+            self.batch_stats_[b] = (m, np.where(s > 0, s, 1.0))
+        return self
+
+    def transform(self, X: np.ndarray, batches: np.ndarray) -> np.ndarray:
+        out = np.empty_like(X, dtype=float)
+        for i, b in enumerate(batches):
+            m, s = self.batch_stats_.get(b, (self.grand_mean_, self.grand_std_))
+            out[i] = (X[i] - m) / s * self.grand_std_ + self.grand_mean_
+        return out
+
+    def fit_transform(self, X: np.ndarray, batches: np.ndarray) -> np.ndarray:
+        return self.fit(X, batches).transform(X, batches)
+
+
+def pearson_feature_mask(X: np.ndarray, threshold: float = 0.95) -> np.ndarray:
+    """Returns boolean keep-mask; correlated pairs are resolved by dropping the higher-index column."""
+    corr = np.corrcoef(X.T)
+    n    = corr.shape[0]
+    keep = np.ones(n, dtype=bool)
+    for i in range(n):
+        if not keep[i]:
+            continue
+        drop = np.where(keep & (np.abs(corr[i]) > threshold))[0]
+        drop = drop[drop > i]
+        keep[drop] = False
+    return keep
+
+
 # ---------------------------------------------------------------------------
 # 3. ComBat batch correction
 # ---------------------------------------------------------------------------
@@ -527,6 +571,7 @@ def run_task(
     features: pd.DataFrame,
     labels: np.ndarray,
     patient_ids: np.ndarray,
+    batches: np.ndarray,
     class_labels: dict = None,
     hidden_dim: int = 256,
     num_epochs: int = 10,
@@ -547,15 +592,15 @@ def run_task(
     if class_labels is None:
         class_labels = {int(u): str(u) for u in unique}
 
-    device    = "cuda" if torch.cuda.is_available() else "cpu"
-    input_dim  = features.shape[1]
+    from sklearn.feature_selection import VarianceThreshold as VT
+
+    device     = "cuda" if torch.cuda.is_available() else "cpu"
     output_dim = len(unique)
 
-    X = features.values.astype(np.float32)
-    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-    y = labels.astype(np.int64)
-
-    feat_names = features.columns.tolist()
+    X_raw          = features.values.astype(float)
+    X_raw          = np.nan_to_num(X_raw, nan=0.0, posinf=0.0, neginf=0.0)
+    y              = labels.astype(np.int64)
+    feat_names_raw = features.columns.tolist()
 
     splitter = (
         StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
@@ -568,13 +613,34 @@ def run_task(
     all_val_targets = []
     roc_curves      = []
 
-    # Variables for SHAP (captured from last fold)
-    shap_pipe = None
-    shap_tr_idx = shap_va_idx = None
+    # State captured from last fold for UMAP and SHAP
+    last: dict = {}
 
-    for fold, (train_idx, val_idx) in enumerate(splitter.split(X, y, patient_ids)):
-        X_tr, y_tr = X[train_idx], y[train_idx]
-        X_va, y_va = X[val_idx],   y[val_idx]
+    for fold, (train_idx, val_idx) in enumerate(splitter.split(X_raw, y, patient_ids)):
+        y_tr, y_va = y[train_idx], y[val_idx]
+
+        # 1. Log transform (deterministic — no leakage — applied identically to both splits)
+        X_tr_log = sign_log_transform_arr(X_raw[train_idx])
+        X_va_log = sign_log_transform_arr(X_raw[val_idx])
+
+        # 2. VarianceThreshold — fit on train
+        vt = VT(threshold=0.0)
+        X_tr_vt = vt.fit_transform(X_tr_log)
+        X_va_vt = vt.transform(X_va_log)
+        vt_names = [feat_names_raw[i] for i in vt.get_support(indices=True)]
+
+        # 3. Batch correction — fit on train, transform val
+        bc = BatchCorrector()
+        X_tr_bc = bc.fit_transform(X_tr_vt, batches[train_idx])
+        X_va_bc = bc.transform(X_va_vt, batches[val_idx])
+
+        # 4. Pearson redundancy reduction — fit on train
+        feat_mask = pearson_feature_mask(X_tr_bc)
+        X_tr = X_tr_bc[:, feat_mask].astype(np.float32)
+        X_va = X_va_bc[:, feat_mask].astype(np.float32)
+        feat_names = [vt_names[i] for i, k in enumerate(feat_mask) if k]
+        input_dim  = X_tr.shape[1]
+        print(f"  Fold {fold+1}: {input_dim} features after preprocessing")
 
         net = NeuralNetClassifier(
             module=MLP,
@@ -621,9 +687,9 @@ def run_task(
         })
         print(f"  Fold {fold+1}: AUC={val_auc:.3f}  Acc={val_acc:.3f}")
 
-        shap_pipe   = pipe
-        shap_tr_idx = train_idx
-        shap_va_idx = val_idx
+        last = dict(pipe=pipe, vt=vt, bc=bc, feat_mask=feat_mask,
+                    feat_names=feat_names, train_idx=train_idx, val_idx=val_idx,
+                    X_tr=X_tr, X_va=X_va)
 
     summary  = pd.DataFrame(metrics_rows)
     mean_row = summary.mean(numeric_only=True)
@@ -637,28 +703,35 @@ def run_task(
     val_probs_cat   = np.concatenate(all_val_probs)
     val_targets_cat = np.concatenate(all_val_targets)
     jsd = plot_probability_distribution(task_name, val_probs_cat, val_targets_cat, class_labels)
-    summary["jsd"] = jsd   # attach scalar to summary for reference
+    summary["jsd"] = jsd
 
-    # --- UMAP + Silhouette ---
-    compute_umap_and_plot(task_name, X, y, class_labels)
+    # --- UMAP: apply last fold's preprocessing to full task subset ---
+    if last:
+        X_full_log = sign_log_transform_arr(X_raw)
+        X_full_vt  = last["vt"].transform(X_full_log)
+        X_full_bc  = last["bc"].transform(X_full_vt, batches)
+        X_full     = X_full_bc[:, last["feat_mask"]].astype(np.float32)
+        compute_umap_and_plot(task_name, X_full, y, class_labels)
 
     # --- SHAP on manuscript features (last fold model) ---
-    if shap_pipe is not None and task_name in MANUSCRIPT_SHAP_FEATURES:
-        scaler     = shap_pipe.named_steps["scaler"]
-        model      = shap_pipe.named_steps["net"].module_
-        X_tr_sc    = scaler.transform(X[shap_tr_idx]).astype(np.float32)
-        X_va_sc    = scaler.transform(X[shap_va_idx]).astype(np.float32)
+    if last and task_name in MANUSCRIPT_SHAP_FEATURES:
+        pipe       = last["pipe"]
+        scaler     = pipe.named_steps["scaler"]
+        model      = pipe.named_steps["net"].module_
+        feat_names = last["feat_names"]
+        X_tr_sc    = scaler.transform(last["X_tr"]).astype(np.float32)
+        X_va_sc    = scaler.transform(last["X_va"]).astype(np.float32)
         bg         = X_tr_sc[np.random.choice(len(X_tr_sc), min(200, len(X_tr_sc)),
                                                replace=False)]
         compute_shap_and_plot(task_name, model, scaler, bg, X_va_sc,
-                               y[shap_va_idx], feat_names, device)
+                               y[last["val_idx"]], feat_names, device)
 
     return {
         "metrics":      summary,
         "roc_curves":   roc_curves,
         "val_probs":    np.concatenate(all_val_probs),
         "val_targets":  np.concatenate(all_val_targets),
-        "feature_names": feat_names,
+        "feature_names": last.get("feat_names", []),
     }
 
 
@@ -672,29 +745,19 @@ def main():
     features, meta = load_data(DATA_CSV)
     print(f"Loaded {len(features)} samples, {features.shape[1]} features")
 
-    # --- Log transform ---
-    print("Applying sign-preserving log transform...")
-    features = sign_log_transform(features)
-
-    # --- ComBat batch correction ---
-    print("Running ComBat batch correction...")
-    features = combat_correction(features, meta["batch"])
-
-    # --- ICC filtering (optional) ---
+    # --- ICC filtering (global: uses separate reproducibility scan, no leakage) ---
     if ICC_CSV is not None and os.path.isfile(ICC_CSV):
         print("Applying ICC feature filtering...")
         features = icc_filter(features, ICC_CSV)
     else:
         print("ICC CSV not provided; skipping ICC filtering step.")
 
-    # --- Redundancy reduction ---
-    print("Running Pearson redundancy reduction...")
-    features = pearson_redundancy_reduction(features)
+    # Log transform, batch correction, and redundancy reduction are performed
+    # inside each CV fold to prevent data leakage from validation samples.
 
-    # Align meta index with reset features index
     meta = meta.reset_index(drop=True)
+    features = features.reset_index(drop=True)
 
-    # Exclude known problematic patient IDs
     mask_valid = ~meta["patient_id"].isin(EXCLUDED_IDS)
 
     # -----------------------------------------------------------------------
@@ -704,8 +767,9 @@ def main():
     X_t1 = features.loc[mask]
     y_t1 = (meta.loc[mask, "tissue"] == "Tu").astype(int).values
     g_t1 = meta.loc[mask, "patient_id"].values
+    b_t1 = meta.loc[mask, "batch"].values
 
-    run_task("tissue_type", X_t1, y_t1, g_t1,
+    run_task("tissue_type", X_t1, y_t1, g_t1, b_t1,
              class_labels={0: "Non-neoplastic", 1: "Neoplastic"})
 
     # -----------------------------------------------------------------------
@@ -720,8 +784,9 @@ def main():
     X_t2 = features.loc[mask]
     y_t2 = meta.loc[mask, "diagnosis_class"].astype(int).values
     g_t2 = meta.loc[mask, "patient_id"].values
+    b_t2 = meta.loc[mask, "batch"].values
 
-    run_task("tumor_type_ftn_vs_ptc", X_t2, y_t2, g_t2,
+    run_task("tumor_type_ftn_vs_ptc", X_t2, y_t2, g_t2, b_t2,
              class_labels={0: "PTC", 1: "FTN"})
 
     # -----------------------------------------------------------------------
@@ -737,8 +802,9 @@ def main():
     X_t3 = features.loc[mask]
     y_t3 = meta.loc[mask, "BRAF p/n"].astype(int).values
     g_t3 = meta.loc[mask, "patient_id"].values
+    b_t3 = meta.loc[mask, "batch"].values
 
-    run_task("braf_v600e", X_t3, y_t3, g_t3,
+    run_task("braf_v600e", X_t3, y_t3, g_t3, b_t3,
              class_labels={0: "BRAF-negative", 1: "BRAF-positive"})
 
     # -----------------------------------------------------------------------
@@ -753,8 +819,9 @@ def main():
     X_t4 = features.loc[mask]
     y_t4 = meta.loc[mask, "Relapse p/n"].astype(int).values
     g_t4 = meta.loc[mask, "patient_id"].values
+    b_t4 = meta.loc[mask, "batch"].values
 
-    run_task("relapse", X_t4, y_t4, g_t4,
+    run_task("relapse", X_t4, y_t4, g_t4, b_t4,
              class_labels={0: "Disease-free", 1: "Relapse"})
 
     # -----------------------------------------------------------------------
@@ -767,7 +834,8 @@ def main():
     # X_t5 = features.loc[mask]
     # y_t5 = meta.loc[mask, "TERT p/n"].astype(int).values
     # g_t5 = meta.loc[mask, "patient_id"].values
-    # run_task("tert_mutation", X_t5, y_t5, g_t5,
+    # b_t5 = meta.loc[mask, "batch"].values
+    # run_task("tert_mutation", X_t5, y_t5, g_t5, b_t5,
     #          class_labels={0: "TERT-wildtype", 1: "TERT-mutated"},
     #          stratified=True, threshold=0.2)
 
