@@ -34,8 +34,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.stats import pearsonr
 from sklearn.model_selection import GroupKFold, StratifiedKFold
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.calibration import CalibratedClassifierCV
 from xgboost import XGBClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
@@ -44,13 +42,6 @@ from sklearn.metrics import (
     f1_score, precision_score, recall_score, silhouette_score,
 )
 from scipy.spatial.distance import jensenshannon
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from skorch import NeuralNetClassifier
-from skorch.callbacks import LRScheduler, EarlyStopping
-from skorch.dataset import ValidSplit
 import shap
 
 warnings.filterwarnings("ignore")
@@ -360,19 +351,6 @@ def pearson_redundancy_reduction(features: pd.DataFrame,
 # 6. MLP model
 # ---------------------------------------------------------------------------
 
-class MLP(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, dropout_rate=0.1):
-        super().__init__()
-        self.fc1     = nn.Linear(input_dim, hidden_dim)
-        self.dropout = nn.Dropout(dropout_rate)
-        self.fc2     = nn.Linear(hidden_dim, output_dim)
-
-    def forward(self, x):
-        h = F.relu(self.fc1(x))
-        h = self.dropout(h)
-        return self.fc2(h)
-
-
 # ---------------------------------------------------------------------------
 # 7. Patient-level stratified group k-fold
 # ---------------------------------------------------------------------------
@@ -438,54 +416,6 @@ def compute_umap_and_save(task_name: str, X: np.ndarray, y: np.ndarray,
 # ---------------------------------------------------------------------------
 # 9. SHAP — saves top-5 data only (no plot)
 # ---------------------------------------------------------------------------
-
-def compute_shap_and_save(task_name: str, model, scaler, X_bg: np.ndarray,
-                           X_explain: np.ndarray, y_explain: np.ndarray,
-                           feature_names: list, device: str, out_dir: str = None):
-    print(f"  Running SHAP for {task_name} on all {len(feature_names)} features...")
-
-    model.eval()
-
-    def predict_fn(x):
-        with torch.no_grad():
-            t = torch.tensor(x, dtype=torch.float32).to(device)
-            return F.softmax(model(t), dim=1).cpu().numpy()
-
-    explainer = shap.KernelExplainer(predict_fn, X_bg)
-    shap_vals = explainer.shap_values(X_explain, nsamples=100)
-
-    if isinstance(shap_vals, list):
-        sv_class1 = shap_vals[1]
-    elif isinstance(shap_vals, np.ndarray) and shap_vals.ndim == 3:
-        sv_class1 = shap_vals[:, :, 1]
-    else:
-        sv_class1 = shap_vals
-
-    mean_abs  = np.abs(sv_class1).mean(axis=0)
-    top5_idx  = np.argsort(mean_abs)[::-1][:5]
-    top5_names = [feature_names[i] for i in top5_idx]
-
-    print(f"  Top 5 SHAP features:")
-    for name, idx in zip(top5_names, top5_idx):
-        print(f"    {name}  (mean |SHAP| = {mean_abs[idx]:.4f})")
-
-    _out = out_dir or OUTPUT_DIR
-
-    # SHAP values for top-5 features
-    df_shap = pd.DataFrame(sv_class1[:, top5_idx], columns=top5_names)
-    df_shap["true_label"] = y_explain
-    df_shap.to_csv(os.path.join(_out, f"{task_name}_shap_values.csv"), index=False)
-
-    # Actual feature values for top-5 (needed for beeswarm colouring)
-    df_feat = pd.DataFrame(X_explain[:, top5_idx], columns=top5_names)
-    df_feat.to_csv(os.path.join(_out, f"{task_name}_shap_feature_values.csv"), index=False)
-
-    # Ranked feature list
-    pd.DataFrame({"rank": range(1, 6), "feature": top5_names,
-                  "mean_abs_shap": mean_abs[top5_idx]}).to_csv(
-        os.path.join(_out, f"{task_name}_shap_top5.csv"), index=False)
-    print(f"  SHAP data saved to {_out}")
-
 
 def compute_shap_rf_and_save(task_name: str, rf_model,
                               X_explain: np.ndarray, y_explain: np.ndarray,
@@ -590,13 +520,6 @@ def run_task(
     patient_ids: np.ndarray,
     batches: np.ndarray,
     class_labels: dict = None,
-    hidden_dim: int = 128,
-    num_epochs: int = 100,
-    batch_size: int = 16,
-    learning_rate: float = 1e-3,
-    weight_decay: float = 1e-2,
-    dropout_rate: float = 0.4,
-    gamma: float = 0.9,
     stratified: bool = False,
     threshold: float = 0.5,
 ):
@@ -614,7 +537,6 @@ def run_task(
 
     from sklearn.feature_selection import VarianceThreshold as VT
 
-    device     = "cuda" if torch.cuda.is_available() else "cpu"
     output_dim = len(unique)
 
     X_raw          = features.values.astype(float)
@@ -628,10 +550,10 @@ def run_task(
         else GroupKFold(n_splits=5)
     )
 
-    metrics_mlp, metrics_rf, metrics_xgb = [], [], []
-    probs_mlp,   probs_rf,   probs_xgb  = [], [], []
-    targets_all                          = []
-    roc_mlp,     roc_rf,     roc_xgb    = [], [], []
+    metrics_xgb = []
+    probs_xgb   = []
+    targets_all = []
+    roc_xgb     = []
 
     last: dict = {}
 
@@ -654,66 +576,6 @@ def run_task(
         X_va = bc.transform(X_va_vt, batches[val_idx]).astype(np.float32)
 
         feat_names = vt_names
-        input_dim  = X_tr.shape[1]
-
-        # ---- MLP ----
-        net = NeuralNetClassifier(
-            module=MLP,
-            module__input_dim=input_dim,
-            module__hidden_dim=hidden_dim,
-            module__output_dim=output_dim,
-            module__dropout_rate=dropout_rate,
-            max_epochs=num_epochs,
-            batch_size=batch_size,
-            optimizer=optim.Adam,
-            optimizer__lr=learning_rate,
-            optimizer__weight_decay=weight_decay,
-            criterion=nn.CrossEntropyLoss,
-            device=device,
-            callbacks=[
-                ("lr_scheduler", LRScheduler(policy="ExponentialLR", gamma=gamma)),
-                ("early_stopping", EarlyStopping(monitor="valid_loss", patience=10, lower_is_better=True)),
-            ],
-            train_split=ValidSplit(0.1, stratified=True),
-            verbose=0,
-        )
-        pipe_mlp = Pipeline([("scaler", StandardScaler()), ("net", net)])
-        pipe_mlp.fit(X_tr, y_tr)
-
-        vp_mlp  = pipe_mlp.predict_proba(X_va)
-        pd_mlp  = (vp_mlp[:, 1] >= threshold).astype(int)
-        fpr_m, tpr_m, _ = roc_curve(y_va, vp_mlp[:, 1])
-        roc_mlp.append((fpr_m, tpr_m))
-        probs_mlp.append(vp_mlp[:, 1])
-        metrics_mlp.append({
-            "fold": fold + 1,
-            "val_auc":       roc_auc_score(y_va, vp_mlp[:, 1]),
-            "val_accuracy":  accuracy_score(y_va, pd_mlp),
-            "val_f1":        f1_score(y_va, pd_mlp, average="weighted", zero_division=0),
-            "val_precision": precision_score(y_va, pd_mlp, average="weighted", zero_division=0),
-            "val_recall":    recall_score(y_va, pd_mlp, average="weighted", zero_division=0),
-        })
-
-        # ---- Random Forest ----
-        pipe_rf = Pipeline([
-            ("scaler", StandardScaler()),
-            ("rf", RandomForestClassifier(n_estimators=500, random_state=42, n_jobs=-1)),
-        ])
-        pipe_rf.fit(X_tr, y_tr)
-
-        vp_rf  = pipe_rf.predict_proba(X_va)
-        pd_rf  = (vp_rf[:, 1] >= threshold).astype(int)
-        fpr_r, tpr_r, _ = roc_curve(y_va, vp_rf[:, 1])
-        roc_rf.append((fpr_r, tpr_r))
-        probs_rf.append(vp_rf[:, 1])
-        metrics_rf.append({
-            "fold": fold + 1,
-            "val_auc":       roc_auc_score(y_va, vp_rf[:, 1]),
-            "val_accuracy":  accuracy_score(y_va, pd_rf),
-            "val_f1":        f1_score(y_va, pd_rf, average="weighted", zero_division=0),
-            "val_precision": precision_score(y_va, pd_rf, average="weighted", zero_division=0),
-            "val_recall":    recall_score(y_va, pd_rf, average="weighted", zero_division=0),
-        })
 
         # ---- XGBoost ----
         n_pos = y_tr.sum()
@@ -744,9 +606,9 @@ def run_task(
         })
 
         targets_all.append(y_va)
-        print(f"  Fold {fold+1}: MLP AUC={metrics_mlp[-1]['val_auc']:.3f}  RF AUC={metrics_rf[-1]['val_auc']:.3f}  XGB AUC={metrics_xgb[-1]['val_auc']:.3f}")
+        print(f"  Fold {fold+1}: AUC={metrics_xgb[-1]['val_auc']:.3f}")
 
-        last = dict(pipe_mlp=pipe_mlp, pipe_rf=pipe_rf, pipe_xgb=pipe_xgb, vt=vt, bc=bc,
+        last = dict(pipe_xgb=pipe_xgb, vt=vt, bc=bc,
                     feat_names=feat_names, train_idx=train_idx, val_idx=val_idx,
                     X_tr=X_tr, X_va=X_va)
 
@@ -776,8 +638,6 @@ def run_task(
             os.path.join(task_dir, f"{task_name}_{tag}_roc_curves.csv"), index=False)
         return df
 
-    summary_mlp = _save_model_results("mlp", metrics_mlp, probs_mlp, roc_mlp)
-    summary_rf  = _save_model_results("rf",  metrics_rf,  probs_rf,  roc_rf)
     summary_xgb = _save_model_results("xgb", metrics_xgb, probs_xgb, roc_xgb)
 
     # --- UMAP (model-independent, use last fold preprocessing) ---
@@ -787,27 +647,11 @@ def run_task(
         X_full     = last["bc"].transform(X_full_vt, batches).astype(np.float32)
         compute_umap_and_save(task_name, X_full, y, class_labels, out_dir=task_dir)
 
-    # --- SHAP (last fold models) ---
+    # --- SHAP (last fold XGBoost) ---
     if last:
         feat_names = last["feat_names"]
 
-        # MLP SHAP
-        scaler  = last["pipe_mlp"].named_steps["scaler"]
-        model   = last["pipe_mlp"].named_steps["net"].module_
-        X_tr_sc = scaler.transform(last["X_tr"]).astype(np.float32)
-        X_va_sc = scaler.transform(last["X_va"]).astype(np.float32)
-        bg      = X_tr_sc[np.random.choice(len(X_tr_sc), min(200, len(X_tr_sc)), replace=False)]
-        compute_shap_and_save(task_name, model, scaler, bg, X_va_sc,
-                              y[last["val_idx"]], feat_names, device, out_dir=task_dir)
-
-        # RF SHAP
-        scaler_rf = last["pipe_rf"].named_steps["scaler"]
-        rf_model  = last["pipe_rf"].named_steps["rf"]
-        X_va_rf   = scaler_rf.transform(last["X_va"]).astype(np.float32)
-        compute_shap_rf_and_save(task_name, rf_model, X_va_rf,
-                                 y[last["val_idx"]], feat_names, out_dir=task_dir)
-
-        # XGBoost SHAP (reuse RF SHAP function — TreeExplainer supports XGBoost)
+        # XGBoost SHAP
         scaler_xgb = last["pipe_xgb"].named_steps["scaler"]
         xgb_model  = last["pipe_xgb"].named_steps["xgb"]
         X_va_xgb   = scaler_xgb.transform(last["X_va"]).astype(np.float32)
@@ -815,8 +659,6 @@ def run_task(
                                  y[last["val_idx"]], feat_names, out_dir=task_dir)
 
     return {
-        "metrics_mlp":   summary_mlp,
-        "metrics_rf":    summary_rf,
         "metrics_xgb":   summary_xgb,
         "feature_names": last.get("feat_names", []),
     }
