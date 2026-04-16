@@ -27,6 +27,7 @@ Dependencies:
 import os
 import warnings
 import itertools
+import json
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -35,6 +36,8 @@ import matplotlib.pyplot as plt
 from scipy.stats import pearsonr
 from sklearn.model_selection import GroupKFold, StratifiedKFold
 from xgboost import XGBClassifier
+import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.metrics import (
@@ -510,7 +513,78 @@ def bootstrap_ci(probs: np.ndarray, targets: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
-# 13. Run one classification task
+# 13. Optuna hyperparameter search
+# ---------------------------------------------------------------------------
+
+def optimize_xgb(task_name: str, features: pd.DataFrame, labels: np.ndarray,
+                 patient_ids: np.ndarray, batches: np.ndarray,
+                 stratified: bool = False, n_trials: int = 50) -> dict:
+    from sklearn.feature_selection import VarianceThreshold as VT
+
+    X_raw = features.values.astype(float)
+    X_raw = np.nan_to_num(X_raw, nan=0.0, posinf=0.0, neginf=0.0)
+    y     = labels.astype(np.int64)
+
+    splitter = (
+        StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
+        if stratified else GroupKFold(n_splits=5)
+    )
+
+    def objective(trial):
+        params = dict(
+            n_estimators      = trial.suggest_int("n_estimators", 100, 1000),
+            learning_rate     = trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            max_depth         = trial.suggest_int("max_depth", 3, 8),
+            subsample         = trial.suggest_float("subsample", 0.5, 1.0),
+            colsample_bytree  = trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            min_child_weight  = trial.suggest_int("min_child_weight", 1, 10),
+            reg_alpha         = trial.suggest_float("reg_alpha", 1e-4, 1.0, log=True),
+            reg_lambda        = trial.suggest_float("reg_lambda", 0.5, 5.0),
+        )
+        aucs = []
+        for train_idx, val_idx in splitter.split(X_raw, y, patient_ids):
+            y_tr, y_va = y[train_idx], y[val_idx]
+            X_tr_log = sign_log_transform_arr(X_raw[train_idx])
+            X_va_log = sign_log_transform_arr(X_raw[val_idx])
+            vt = VT(threshold=0.0)
+            X_tr_vt = vt.fit_transform(X_tr_log)
+            X_va_vt = vt.transform(X_va_log)
+            bc = BatchCorrector()
+            X_tr = bc.fit_transform(X_tr_vt, batches[train_idx]).astype(np.float32)
+            X_va = bc.transform(X_va_vt, batches[val_idx]).astype(np.float32)
+            n_pos = y_tr.sum()
+            n_neg = len(y_tr) - n_pos
+            spw   = n_neg / n_pos if n_pos > 0 else 1.0
+            clf   = XGBClassifier(**params, scale_pos_weight=spw,
+                                  eval_metric="logloss", random_state=42,
+                                  n_jobs=-1, verbosity=0)
+            pipe  = Pipeline([("scaler", StandardScaler()), ("xgb", clf)])
+            pipe.fit(X_tr, y_tr)
+            vp = pipe.predict_proba(X_va)
+            if len(np.unique(y_va)) > 1:
+                aucs.append(roc_auc_score(y_va, vp[:, 1]))
+        return np.mean(aucs) if aucs else 0.0
+
+    print(f"\n  Optimizing XGBoost for [{task_name}] ({n_trials} trials)...")
+    study = optuna.create_study(direction="maximize",
+                                sampler=optuna.samplers.TPESampler(seed=42))
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+
+    best = study.best_params
+    best_auc = study.best_value
+    print(f"  Best AUC: {best_auc:.4f}")
+    print(f"  Best params: {best}")
+
+    task_dir = os.path.join(OUTPUT_DIR, task_name)
+    os.makedirs(task_dir, exist_ok=True)
+    with open(os.path.join(task_dir, f"{task_name}_best_params.json"), "w") as f:
+        json.dump({"best_auc": best_auc, **best}, f, indent=2)
+
+    return best
+
+
+# ---------------------------------------------------------------------------
+# 14. Run one classification task
 # ---------------------------------------------------------------------------
 
 def run_task(
@@ -522,6 +596,7 @@ def run_task(
     class_labels: dict = None,
     stratified: bool = False,
     threshold: float = 0.5,
+    xgb_params: dict = None,
 ):
     print(f"\n{'='*60}\nTask: {task_name}\n{'='*60}")
     unique, counts = np.unique(labels, return_counts=True)
@@ -581,9 +656,12 @@ def run_task(
         n_pos = y_tr.sum()
         n_neg = len(y_tr) - n_pos
         spw   = n_neg / n_pos if n_pos > 0 else 1.0
+        base_params = dict(n_estimators=500, learning_rate=0.05, max_depth=4,
+                           subsample=0.8, colsample_bytree=0.8)
+        if xgb_params:
+            base_params.update(xgb_params)
         xgb   = XGBClassifier(
-            n_estimators=500, learning_rate=0.05, max_depth=4,
-            subsample=0.8, colsample_bytree=0.8,
+            **base_params,
             scale_pos_weight=spw,
             eval_metric="logloss", random_state=42,
             n_jobs=-1, verbosity=0,
@@ -713,8 +791,10 @@ def main():
     g_t1 = meta.loc[mask, "patient_id"].values
     b_t1 = meta.loc[mask, "batch"].values
 
+    p_t1 = optimize_xgb("tissue_type", X_t1, y_t1, g_t1, b_t1)
     run_task("tissue_type", X_t1, y_t1, g_t1, b_t1,
-             class_labels={0: "Non-neoplastic", 1: "Neoplastic"})
+             class_labels={0: "Non-neoplastic", 1: "Neoplastic"},
+             xgb_params=p_t1)
 
     # -----------------------------------------------------------------------
     # Task 2: Tumor type (FTN=0 vs PTC=1)
@@ -730,8 +810,10 @@ def main():
     g_t2 = meta.loc[mask, "patient_id"].values
     b_t2 = meta.loc[mask, "batch"].values
 
+    p_t2 = optimize_xgb("tumor_type_ftn_vs_ptc", X_t2, y_t2, g_t2, b_t2)
     run_task("tumor_type_ftn_vs_ptc", X_t2, y_t2, g_t2, b_t2,
-             class_labels={0: "PTC", 1: "FTN"})
+             class_labels={0: "PTC", 1: "FTN"},
+             xgb_params=p_t2)
 
     # -----------------------------------------------------------------------
     # Task 3: BRAF V600E status (0=negative, 1=positive)
@@ -749,8 +831,10 @@ def main():
     g_t3 = meta.loc[mask, "patient_id"].values
     b_t3 = meta.loc[mask, "batch"].values
 
+    p_t3 = optimize_xgb("braf_v600e", X_t3, y_t3, g_t3, b_t3)
     run_task("braf_v600e", X_t3, y_t3, g_t3, b_t3,
-             class_labels={0: "BRAF wild-type", 1: "BRAF mutant"})
+             class_labels={0: "BRAF wild-type", 1: "BRAF mutant"},
+             xgb_params=p_t3)
 
     # -----------------------------------------------------------------------
     # Task 4: Relapse prediction (0=no relapse, 1=relapse)
@@ -766,8 +850,10 @@ def main():
     g_t4 = meta.loc[mask, "patient_id"].values
     b_t4 = meta.loc[mask, "batch"].values
 
+    p_t4 = optimize_xgb("relapse", X_t4, y_t4, g_t4, b_t4)
     run_task("relapse", X_t4, y_t4, g_t4, b_t4,
-             class_labels={0: "Disease-free", 1: "Relapse"})
+             class_labels={0: "Disease-free", 1: "Relapse"},
+             xgb_params=p_t4)
 
     # -----------------------------------------------------------------------
     # Task 5: TERT promoter mutation
