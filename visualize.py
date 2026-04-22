@@ -18,8 +18,8 @@ import shap
 
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results")
 
-MODEL       = "xgb"
-MODEL_LABEL = "XGBoost"
+MODEL       = "mlp"
+MODEL_LABEL = "MLP"
 
 # Global color palette
 PALETTE = {
@@ -171,10 +171,9 @@ def plot_prob_dist(task_name, task_dir):
 # ---------------------------------------------------------------------------
 
 def plot_shap(task_name, task_dir):
-    prefix    = f"{task_name}_{MODEL}_rf" if MODEL != "rf" else f"{task_name}_rf"
-    shap_path = os.path.join(task_dir, f"{prefix}_shap_values.csv")
-    feat_path = os.path.join(task_dir, f"{prefix}_shap_feature_values.csv")
-    top5_path = os.path.join(task_dir, f"{prefix}_shap_top5.csv")
+    shap_path = os.path.join(task_dir, f"{task_name}_shap_values.csv")
+    feat_path = os.path.join(task_dir, f"{task_name}_shap_feature_values.csv")
+    top5_path = os.path.join(task_dir, f"{task_name}_shap_top5.csv")
     if not os.path.isfile(shap_path):
         return
 
