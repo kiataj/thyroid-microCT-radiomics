@@ -49,6 +49,37 @@ def compute_shap_mlp_and_save(task_name: str, model, device: str,
     _save_shap(task_name, sv, X_explain, y_explain, feature_names, out_dir, top_n)
 
 
+def compute_shap_sklearn_and_save(task_name: str, clf_pipeline,
+                                   X_bg: np.ndarray, X_explain: np.ndarray,
+                                   y_explain: np.ndarray,
+                                   feature_names: list, out_dir: str, top_n: int = 5) -> None:
+    print(f"  Running SHAP for {task_name}...")
+    scaler = clf_pipeline.named_steps["scaler"]
+    module = clf_pipeline.named_steps["net"].module_
+    device = next(module.parameters()).device
+
+    module.eval()
+    X_bg_sc  = scaler.transform(X_bg).astype(np.float32)
+    X_exp_sc = scaler.transform(X_explain).astype(np.float32)
+    clip_lo  = X_bg_sc.min(axis=0) - 3.0
+    clip_hi  = X_bg_sc.max(axis=0) + 3.0
+    X_exp_sc = np.clip(X_exp_sc, clip_lo, clip_hi)
+    bg_t  = torch.tensor(X_bg_sc,  device=device)
+    exp_t = torch.tensor(X_exp_sc, device=device)
+
+    explainer = shap.GradientExplainer(module, bg_t)
+    shap_vals = explainer.shap_values(exp_t)
+
+    if isinstance(shap_vals, list):
+        sv = np.array(shap_vals[1])
+    elif isinstance(shap_vals, np.ndarray) and shap_vals.ndim == 3:
+        sv = shap_vals[:, :, 1]
+    else:
+        sv = np.array(shap_vals)
+
+    _save_shap(task_name, sv, X_explain, y_explain, feature_names, out_dir, top_n)
+
+
 def _save_shap(task_name, sv, X_explain, y_explain, feature_names, out_dir, top_n):
     mean_abs  = np.abs(sv).mean(axis=0)
     top_idx   = np.argsort(mean_abs)[::-1][:top_n]

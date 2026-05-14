@@ -6,7 +6,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 ROOT        = Path(__file__).resolve().parent.parent
 RESULTS_DIR = ROOT / "results"
-DATA_CSV     = ROOT / "Radiomics_v6.csv"
+DATA_CSV     = ROOT / "radiomics_v6.csv"
 DATA_CSV_EMB = ROOT / "embeddings_and_labels.csv"
 LABELS_CSV  = ROOT / "ngTMA_table.csv"
 ICC_CSV     = ROOT / "radiomics.csv"
@@ -36,6 +36,7 @@ FEATURE_PREFIXES = (
 DIAGNOSIS_MAP: dict[str, int] = {
     # String labels (TMAs 64 / 93 / 94 and ngTMA_table)
     "PTC":    0,
+    "FVPTC":  4,
     "FA":     1,
     "FTC":    1,
     "PDTC":   2,
@@ -79,8 +80,11 @@ class TaskConfig:
     class_labels: dict
     stratified: bool = False
     threshold: float = 0.5
+    class_weights: list = None
     hidden_dim: int = 128
     num_epochs: int = 100
     batch_size: int = 16
+    learning_rate: float = 1e-3
+    weight_decay: float = 1e-2
     dropout_rate: float = 0.4
-    class_weights: list = None
+    gamma: float = 0.9

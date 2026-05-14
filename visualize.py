@@ -21,6 +21,22 @@ RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results")
 MODEL       = "mlp"
 MODEL_LABEL = "MLP"
 
+# Standardised panel dimensions and font sizes
+PANEL_FIGSIZE  = (5, 4)
+FONT_SIZE      = 10
+TICK_SIZE      = 9
+LEGEND_SIZE    = 9
+
+PROB_DIST_KDE  = False   # True: KDE density curve / False: frequency histogram
+
+plt.rcParams.update({
+    "font.size":        FONT_SIZE,
+    "axes.labelsize":   FONT_SIZE,
+    "xtick.labelsize":  TICK_SIZE,
+    "ytick.labelsize":  TICK_SIZE,
+    "legend.fontsize":  LEGEND_SIZE,
+})
+
 # Global color palette
 PALETTE = {
     "main":    "#1565C0",   # deep blue   — ROC curve, UMAP class 0
@@ -66,7 +82,7 @@ def plot_umap(task_name, task_dir):
     class_labels = {int(k): v for k, v in meta["class_labels"].items()}
     sil  = meta["silhouette"]
 
-    fig, ax = plt.subplots(figsize=(6, 5))
+    fig, ax = plt.subplots(figsize=PANEL_FIGSIZE)
     for cls, label in class_labels.items():
         mask = emb["label"] == cls
         ax.scatter(emb.loc[mask, "umap1"], emb.loc[mask, "umap2"],
@@ -104,15 +120,15 @@ def plot_roc(task_name, task_dir):
     mean_auc   = metrics["val_auc"].mean()
     std_auc    = metrics["val_auc"].std()
 
-    auc_label = f"AUC = {mean_auc:.3f} ± {std_auc:.3f}"
+    auc_label = f"AUC = {mean_auc:.2f} ± {std_auc:.2f}"
     if os.path.isfile(ci_path):
         ci = pd.read_csv(ci_path)
         row = ci[ci["metric"] == "auc"]
         if not row.empty:
             lo, hi = row.iloc[0]["ci_lower"], row.iloc[0]["ci_upper"]
-            auc_label += f"\n95% CI [{lo:.3f}, {hi:.3f}]"
+            auc_label += f"\n95% CI [{lo:.2f}, {hi:.2f}]"
 
-    fig, ax = plt.subplots(figsize=(7, 5))
+    fig, ax = plt.subplots(figsize=PANEL_FIGSIZE)
     for f in folds:
         fd = roc[roc["fold"] == f]
         ax.plot(fd["fpr"], fd["tpr"], alpha=0.2, color=MODEL_COLOR, lw=1)
@@ -124,7 +140,6 @@ def plot_roc(task_name, task_dir):
     ax.plot([0, 1], [0, 1], color=PALETTE["neutral"], lw=1, linestyle="--")
     ax.set_xlabel("False positive rate")
     ax.set_ylabel("True positive rate")
-    ax.set_title(f"ROC — {task_name}")
     ax.legend(fontsize=9)
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
@@ -147,19 +162,33 @@ def plot_prob_dist(task_name, task_dir):
     df   = pd.read_csv(probs_path)
     meta = load_json(meta_path)
     class_labels = {int(k): v for k, v in meta["class_labels"].items()}
-    jsd  = meta["jsd"]
 
-    bin_edges = np.linspace(0, 1, 21)
-    fig, ax   = plt.subplots(figsize=(6, 4))
-    for cls, color in zip(sorted(class_labels.keys()), CLASS_COLORS):
-        vals = df.loc[df["true_label"] == cls, "prob_class1"].values
-        ax.hist(vals, bins=bin_edges, alpha=0.55, color=color,
-                label=class_labels[cls], density=True, edgecolor="none")
-    ax.set_xlabel("Predicted probability (class 1)")
-    ax.set_ylabel("Density")
-    ax.set_title(f"Probability distribution — {task_name}\nJSD = {jsd:.3f}")
+    fig, ax = plt.subplots(figsize=PANEL_FIGSIZE)
+    if PROB_DIST_KDE:
+        from scipy.stats import gaussian_kde
+        x_grid = np.linspace(0, 1, 300)
+        for cls, color in zip(sorted(class_labels.keys()), CLASS_COLORS):
+            vals = df.loc[df["true_label"] == cls, "prob_class1"].values
+            if len(vals) < 2:
+                continue
+            kde     = gaussian_kde(vals, bw_method=0.2)
+            density = kde(x_grid)
+            ax.plot(x_grid, density, color=color, lw=2, label=class_labels[cls])
+            ax.fill_between(x_grid, density, alpha=0.25, color=color)
+        ax.set_ylabel("Density")
+    else:
+        bins = np.linspace(0, 1, 21).tolist()
+        for cls, color in zip(sorted(class_labels.keys()), CLASS_COLORS):
+            vals = df.loc[df["true_label"] == cls, "prob_class1"].to_numpy()
+            if len(vals) < 2:
+                continue
+            ax.hist(vals, bins=bins, color=color, alpha=0.5,
+                    label=class_labels[cls], edgecolor="none")
+        ax.set_ylabel("Frequency")
+    ax.set_xlabel("Predicted probability")
     ax.legend(fontsize=9)
     ax.set_xlim(0, 1)
+    ax.set_ylim(bottom=0)
     fig.tight_layout()
     fig.savefig(os.path.join(task_dir, f"{task_name}_prob_dist.png"), dpi=150)
     plt.close(fig)
@@ -191,8 +220,13 @@ def plot_shap(task_name, task_dir):
     mapping.to_csv(os.path.join(task_dir, f"{task_name}_shap_feature_labels.csv"), index=False)
 
     shap.summary_plot(sv, Xv, feature_names=short_names,
-                      show=False, plot_type="dot", color_bar=True)
-    plt.title(f"SHAP — {task_name}")
+                      show=False, plot_type="dot", color_bar=True,
+                      plot_size=(9, 3))
+    for ax in plt.gcf().axes:
+        ax.tick_params(labelsize=TICK_SIZE)
+        ax.xaxis.label.set_size(FONT_SIZE)
+        ax.yaxis.label.set_size(FONT_SIZE)
+    plt.gca().set_xlabel("SHAP value")
     plt.tight_layout()
     plt.savefig(os.path.join(task_dir, f"{task_name}_shap.png"),
                 dpi=150, bbox_inches="tight")
@@ -201,6 +235,98 @@ def plot_shap(task_name, task_dir):
     print(f"  Feature labels:")
     for _, r in mapping.iterrows():
         print(f"    {r['label']}: {r['feature']}")
+
+
+# ---------------------------------------------------------------------------
+# Confusion matrix
+# ---------------------------------------------------------------------------
+
+def plot_confusion_matrix(task_name, task_dir):
+    cm_path = os.path.join(task_dir, f"{task_name}_{MODEL}_confusion_matrix.csv")
+    if not os.path.isfile(cm_path):
+        return
+
+    cm  = pd.read_csv(cm_path, index_col=0)
+    vals = cm.values.astype(float)
+
+    fig, ax = plt.subplots(figsize=(4, 3.5))
+    im = ax.imshow(vals, cmap="Blues")
+    ax.set_xticks([0, 1])
+    ax.set_yticks([0, 1])
+    ax.set_xticklabels(cm.columns, fontsize=8)
+    ax.set_yticklabels(cm.index, fontsize=8)
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    thresh = vals.max() / 2
+    for i in range(vals.shape[0]):
+        for j in range(vals.shape[1]):
+            ax.text(j, i, int(vals[i, j]), ha="center", va="center", fontsize=12,
+                    color="white" if vals[i, j] > thresh else "black")
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("Actual")
+    ax.set_title(f"Confusion matrix — {task_name}\n({MODEL_LABEL})")
+    fig.tight_layout()
+    fig.savefig(os.path.join(task_dir, f"{task_name}_confusion_matrix.png"), dpi=150)
+    plt.close(fig)
+    print(f"  Saved {task_name}_confusion_matrix.png")
+
+
+# ---------------------------------------------------------------------------
+# Model comparison — XGBoost vs Logistic Regression
+# ---------------------------------------------------------------------------
+
+def plot_model_comparison(task_name, task_dir):
+    tags   = ["mlp", "lr", "svm"]
+    labels = {"mlp": "MLP", "lr": "Logistic Reg.", "svm": "SVM (RBF)"}
+    colors = [MODEL_COLOR, PALETTE["accent"], PALETTE["neutral"]]
+
+    records = {}
+    for tag in tags:
+        mpath  = os.path.join(task_dir, f"{task_name}_{tag}_metrics.csv")
+        cipath = os.path.join(task_dir, f"{task_name}_{tag}_bootstrap_ci.csv")
+        if not os.path.isfile(mpath):
+            continue
+        metrics = pd.read_csv(mpath)
+        ci      = pd.read_csv(cipath) if os.path.isfile(cipath) else pd.DataFrame()
+        records[tag] = (metrics, ci)
+
+    if len(records) < 2:
+        return
+
+    metrics_to_show = [("val_auc", "AUC"), ("val_auprc", "AUPRC")]
+    fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+    x = np.arange(len(tags))
+
+    for ax, (col, ylabel) in zip(axes, metrics_to_show):
+        for i, (tag, color) in enumerate(zip(tags, colors)):
+            if tag not in records:
+                continue
+            metrics, ci = records[tag]
+            if col not in metrics.columns:
+                continue
+            mean = metrics[col].mean()
+            std  = metrics[col].std()
+
+            ci_row = ci[ci["metric"] == col.replace("val_", "")] if not ci.empty else pd.DataFrame()
+            if not ci_row.empty:
+                lo = ci_row.iloc[0]["ci_lower"]
+                hi = ci_row.iloc[0]["ci_upper"]
+                yerr = np.array([[mean - lo], [hi - mean]])
+            else:
+                yerr = [[std], [std]]
+
+            ax.bar(i, mean, color=color, alpha=0.8, label=labels[tag])
+            ax.errorbar(i, mean, yerr=yerr, fmt="none", color="black", capsize=5, lw=1.5)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels([labels[t] for t in tags], fontsize=9)
+        ax.set_ylabel(ylabel)
+        ax.set_ylim(0.5, 0.9)
+        ax.set_title(f"{ylabel} — {task_name}")
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(task_dir, f"{task_name}_model_comparison.png"), dpi=150)
+    plt.close(fig)
+    print(f"  Saved {task_name}_model_comparison.png")
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +340,8 @@ def main():
         plot_roc(task_name, task_dir)
         plot_prob_dist(task_name, task_dir)
         plot_shap(task_name, task_dir)
+        plot_confusion_matrix(task_name, task_dir)
+        plot_model_comparison(task_name, task_dir)
     print("\nDone.")
 
 
