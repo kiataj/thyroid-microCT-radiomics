@@ -7,7 +7,6 @@ import torch.optim as optim
 import torch.nn as nn
 from skorch import NeuralNetClassifier
 from skorch.callbacks import LRScheduler
-from skorch.dataset import ValidSplit
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import confusion_matrix, roc_curve
 from sklearn.model_selection import GridSearchCV, GroupKFold
@@ -20,7 +19,6 @@ from .cv import StratifiedGroupKFold
 from .evaluation import compute_fold_metrics, bootstrap_ci, save_probability_data
 from .explainability import compute_shap_sklearn_and_save
 from .mlp import MLP
-from .preprocessing import BatchCorrector
 
 
 class TaskRunner:
@@ -29,7 +27,7 @@ class TaskRunner:
 
     def run(self, config: TaskConfig, features: pd.DataFrame,
             labels: np.ndarray, patient_ids: np.ndarray,
-            batches: np.ndarray, main_only: bool = False) -> dict:
+            main_only: bool = False, run_shap: bool = False) -> dict:
         task_name = config.name
         print(f"\n{'='*60}\nTask: {task_name}\n{'='*60}")
 
@@ -43,8 +41,7 @@ class TaskRunner:
 
         y              = labels.astype(np.int64)
         feat_names_raw = features.columns.tolist()
-        X_raw = np.nan_to_num(features.values.astype(float),
-                              nan=0.0, posinf=0.0, neginf=0.0)
+        X_raw = features.values.astype(np.float32)
 
         splitter = (StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
                     if config.stratified else GroupKFold(n_splits=5))
@@ -74,13 +71,15 @@ class TaskRunner:
                                 cv=3, scoring="roc_auc", refit=True, n_jobs=-1)
 
         device     = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"  Training on: {device}")
         output_dim = len(np.unique(y))
+        cw_tensor  = torch.tensor(cw, dtype=torch.float32) if cw is not None else None
 
         def mlp_factory():
             net = NeuralNetClassifier(
                 module              = MLP,
                 module__input_dim   = X_raw.shape[1],
-                module__hidden_dim  = config.hidden_dim,
+                module__hidden_dims = config.hidden_dims,
                 module__output_dim  = output_dim,
                 module__dropout_rate= config.dropout_rate,
                 max_epochs          = config.num_epochs,
@@ -89,26 +88,26 @@ class TaskRunner:
                 optimizer__lr       = config.learning_rate,
                 optimizer__weight_decay = config.weight_decay,
                 criterion           = nn.CrossEntropyLoss,
+                criterion__weight   = cw_tensor,
                 device              = device,
                 callbacks           = [
                     ("lr_scheduler", LRScheduler(policy="ExponentialLR", gamma=config.gamma)),
                 ],
-                train_split         = ValidSplit(0.1, stratified=True),
+                train_split         = None,
                 verbose             = 0,
             )
             return Pipeline([("scaler", StandardScaler()), ("net", net)])
 
-        mlp_last = self._run_cv("mlp", mlp_factory, fold_splits, X_raw, y, batches,
-                                config, feat_names_raw, task_dir, task_name, scale=False)
+        mlp_last = self._run_cv("mlp", mlp_factory, fold_splits, X_raw, y,
+                                config, feat_names_raw, task_dir, task_name)
 
         if not main_only:
-            self._run_cv("lr", lr_factory, fold_splits, X_raw, y, batches,
-                         config, feat_names_raw, task_dir, task_name, scale=True)
+            self._run_cv("lr", lr_factory, fold_splits, X_raw, y,
+                         config, feat_names_raw, task_dir, task_name)
+            self._run_cv("svm", svm_factory, fold_splits, X_raw, y,
+                         config, feat_names_raw, task_dir, task_name)
 
-            self._run_cv("svm", svm_factory, fold_splits, X_raw, y, batches,
-                         config, feat_names_raw, task_dir, task_name, scale=True)
-
-        if mlp_last:
+        if run_shap and mlp_last:
             X_oof  = mlp_last["X_oof"]
             bg_idx = np.random.default_rng(42).choice(len(X_oof), min(100, len(X_oof)), replace=False)
             compute_shap_sklearn_and_save(task_name, mlp_last["clf"],
@@ -118,8 +117,8 @@ class TaskRunner:
 
         return {"feature_names": mlp_last.get("feat_names", [])}
 
-    def _run_cv(self, tag, clf_factory, fold_splits, X_raw, y, batches,
-                config, feat_names, task_dir, task_name, scale=False):
+    def _run_cv(self, tag, clf_factory, fold_splits, X_raw, y,
+                config, feat_names, task_dir, task_name):
         metrics_rows  = []
         probs_list    = []
         targets_list  = []
@@ -130,14 +129,7 @@ class TaskRunner:
 
         for fold, (train_idx, val_idx) in enumerate(fold_splits):
             y_tr, y_va = y[train_idx], y[val_idx]
-            bc   = BatchCorrector()
-            X_tr = bc.fit_transform(X_raw[train_idx], batches[train_idx]).astype(np.float32)
-            X_va = bc.transform(X_raw[val_idx], batches[val_idx]).astype(np.float32)
-
-            if scale:
-                sc   = StandardScaler()
-                X_tr = sc.fit_transform(X_tr).astype(np.float32)
-                X_va = sc.transform(X_va).astype(np.float32)
+            X_tr, X_va = X_raw[train_idx], X_raw[val_idx]
 
             clf = clf_factory()
             clf.fit(X_tr, y_tr)

@@ -27,7 +27,7 @@ FONT_SIZE      = 10
 TICK_SIZE      = 9
 LEGEND_SIZE    = 9
 
-PROB_DIST_KDE  = False   # True: KDE density curve / False: frequency histogram
+PROB_DIST_KDE  = True    # True: KDE density curve / False: frequency histogram
 
 plt.rcParams.update({
     "font.size":        FONT_SIZE,
@@ -227,6 +227,8 @@ def plot_shap(task_name, task_dir):
         ax.xaxis.label.set_size(FONT_SIZE)
         ax.yaxis.label.set_size(FONT_SIZE)
     plt.gca().set_xlabel("SHAP value")
+    if task_name == "braf_v600e":
+        plt.gca().set_xlim(-1, 1)
     plt.tight_layout()
     plt.savefig(os.path.join(task_dir, f"{task_name}_shap.png"),
                 dpi=150, bbox_inches="tight")

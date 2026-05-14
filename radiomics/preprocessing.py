@@ -14,33 +14,16 @@ def sign_log_transform_arr(X: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Batch correction
+# ComBat batch correction (global)
 # ---------------------------------------------------------------------------
 
-class BatchCorrector:
-    """Per-batch mean/variance normalisation with sklearn-style fit/transform API."""
-
-    def fit(self, X: np.ndarray, batches: np.ndarray) -> "BatchCorrector":
-        self.grand_mean_ = X.mean(axis=0)
-        gs = X.std(axis=0)
-        self.grand_std_  = np.where(gs > 0, gs, 1.0)
-        self.batch_stats_: dict = {}
-        for b in np.unique(batches):
-            mask = batches == b
-            m = X[mask].mean(axis=0)
-            s = X[mask].std(axis=0)
-            self.batch_stats_[b] = (m, np.where(s > 0, s, 1.0))
-        return self
-
-    def transform(self, X: np.ndarray, batches: np.ndarray) -> np.ndarray:
-        out = np.empty_like(X, dtype=float)
-        for i, b in enumerate(batches):
-            m, s = self.batch_stats_.get(b, (self.grand_mean_, self.grand_std_))
-            out[i] = (X[i] - m) / s * self.grand_std_ + self.grand_mean_
-        return out
-
-    def fit_transform(self, X: np.ndarray, batches: np.ndarray) -> np.ndarray:
-        return self.fit(X, batches).transform(X, batches)
+def combat_correct(features: pd.DataFrame, batches: pd.Series) -> pd.DataFrame:
+    from combat.pycombat import pycombat
+    batch_codes = pd.Series(pd.factorize(batches.astype(str))[0])
+    corrected   = pycombat(features.T, batch_codes).T
+    corrected.columns = features.columns
+    corrected.index   = features.index
+    return corrected
 
 
 # ---------------------------------------------------------------------------
@@ -51,35 +34,61 @@ def icc_filter(features: pd.DataFrame, repro_csv: str,
                threshold: float = 0.75, p_threshold: float = 0.05) -> pd.DataFrame:
     from pingouin import intraclass_corr
     from tqdm import tqdm
+    from sklearn.feature_selection import VarianceThreshold as VT
+    from sklearn.preprocessing import StandardScaler
 
-    repro  = pd.read_csv(repro_csv, low_memory=False)
-    scan1  = repro[repro["TMA"] == "H64"].copy()
-    scan2  = repro[repro["TMA"] == "V64"].copy()
-    merged = scan1.merge(scan2, on=["Grid", "x", "y"], suffixes=("_s1", "_s2"))
+    df = pd.read_csv(repro_csv, low_memory=False)
+    df = df[df.columns.drop(list(df.filter(regex="diagnos")))]
+    df = df[df.columns.drop(list(df.filter(regex="Unnamed")))]
 
-    feat_cols = [c for c in features.columns if c in repro.columns]
-    reliable  = []
+    meta     = df[["TMA", "Grid", "x", "y"]]
+    feat_cols_repro = [c for c in df.columns if c not in ["TMA", "Grid", "x", "y"]]
+    rad      = df[feat_cols_repro].copy()
 
-    for col in tqdm(feat_cols, desc="ICC"):
-        c1, c2 = col + "_s1", col + "_s2"
-        if c1 not in merged.columns or c2 not in merged.columns:
-            continue
-        pairs = merged[[c1, c2]].dropna()
-        if len(pairs) < 3:
-            continue
-        combined = pd.DataFrame({
-            "sample": list(range(len(pairs))) * 2,
-            "rater":  [1] * len(pairs) + [2] * len(pairs),
-            "value":  list(pairs[c1]) + list(pairs[c2]),
-        })
-        stats   = intraclass_corr(data=combined, targets="sample", raters="rater",
-                                   ratings="value", nan_policy="omit")
+    # VarianceThreshold
+    sel  = VT(threshold=0.0)
+    arr  = sel.fit_transform(rad)
+    rad  = pd.DataFrame(arr, index=rad.index, columns=rad.columns[sel.get_support()])
+
+    # Sign-log transform
+    rad = np.sign(rad) * np.log1p(np.abs(rad))
+
+    # Split H64 / V64 and pair by (Grid, x, y)
+    feat_cols = [c for c in features.columns if c in rad.columns]
+    keys      = ["Grid", "x", "y"]
+
+    h_meta = meta[meta["TMA"] == "H64"][keys].reset_index(drop=True)
+    v_meta = meta[meta["TMA"] == "V64"][keys].reset_index(drop=True)
+    h_rad  = rad.loc[meta["TMA"] == "H64", feat_cols].reset_index(drop=True)
+    v_rad  = rad.loc[meta["TMA"] == "V64", feat_cols].reset_index(drop=True)
+    h_meta["_idx"] = range(len(h_meta))
+    v_meta["_idx"] = range(len(v_meta))
+    pairs  = h_meta.merge(v_meta, on=keys, suffixes=("_h", "_v"))
+    h64    = h_rad.iloc[pairs["_idx_h"].values].reset_index(drop=True)
+    v64    = v_rad.iloc[pairs["_idx_v"].values].reset_index(drop=True)
+
+    # Scale each rater independently (matches scale=True in original)
+    h64 = pd.DataFrame(StandardScaler().fit_transform(h64), columns=feat_cols)
+    v64 = pd.DataFrame(StandardScaler().fit_transform(v64), columns=feat_cols)
+
+    n = len(h64)
+    h64.insert(0, "rater", 1)
+    h64.insert(1, "subject", range(1, n + 1))
+    v64.insert(0, "rater", 2)
+    v64.insert(1, "subject", range(1, n + 1))
+    stacked   = pd.concat([h64, v64], ignore_index=True).dropna(axis="columns")
+    available = [c for c in feat_cols if c in stacked.columns]
+
+    reliable = []
+    for col in tqdm(available, desc="ICC"):
+        stats   = intraclass_corr(data=stacked, targets="subject", raters="rater",
+                                   ratings=col, nan_policy="omit")
         icc_val = stats["ICC"].iloc[2]
         p_val   = stats["pval"].iloc[2]
         if icc_val > threshold and p_val < p_threshold:
             reliable.append(col)
 
-    print(f"ICC: {len(reliable)} / {len(feat_cols)} features retained")
+    print(f"ICC: {len(reliable)} / {len(available)} features retained")
     return features[[c for c in reliable if c in features.columns]]
 
 
@@ -88,21 +97,24 @@ def icc_filter(features: pd.DataFrame, repro_csv: str,
 # ---------------------------------------------------------------------------
 
 def pearson_redundancy_reduction(features: pd.DataFrame,
-                                  threshold: float = 0.75) -> pd.DataFrame:
+                                  threshold: float = 0.75,
+                                  p_threshold: float = 0.05) -> pd.DataFrame:
+    import itertools
+    from random import Random
+    from scipy.stats import pearsonr
     from collections import Counter
 
-    cols = features.columns.tolist()
-    X    = features.values.astype(float)
-    corr = np.corrcoef(X.T)
-    n    = len(cols)
-    keep = np.ones(n, dtype=bool)
+    cols     = features.columns.tolist()
+    keep     = np.ones(len(cols), dtype=bool)
+    rng      = Random(42)
 
-    for i in range(n):
-        if not keep[i]:
+    for col1, col2 in itertools.combinations(cols, 2):
+        i1, i2 = cols.index(col1), cols.index(col2)
+        if not keep[i1] or not keep[i2]:
             continue
-        drop = np.where(keep & (np.abs(corr[i]) > threshold))[0]
-        drop = drop[drop > i]
-        keep[drop] = False
+        r, p = pearsonr(features[col1], features[col2])
+        if r > threshold and p < p_threshold:
+            keep[rng.choice([i1, i2])] = False
 
     retained = [c for c, k in zip(cols, keep) if k]
     print(f"Pearson redundancy: {len(retained)} / {len(cols)} features retained")

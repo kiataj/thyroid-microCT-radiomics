@@ -10,6 +10,7 @@ DATA_CSV     = ROOT / "radiomics_v6.csv"
 DATA_CSV_EMB = ROOT / "embeddings_and_labels.csv"
 LABELS_CSV  = ROOT / "ngTMA_table.csv"
 ICC_CSV     = ROOT / "radiomics.csv"
+ICC_CACHE     = RESULTS_DIR / "icc_features.txt"
 FEATURE_CACHE = RESULTS_DIR / "retained_feature_names.txt"
 
 RESULTS_DIR.mkdir(exist_ok=True)
@@ -81,7 +82,7 @@ class TaskConfig:
     stratified: bool = False
     threshold: float = 0.5
     class_weights: list = None
-    hidden_dim: int = 128
+    hidden_dims: tuple = (128,)
     num_epochs: int = 100
     batch_size: int = 16
     learning_rate: float = 1e-3

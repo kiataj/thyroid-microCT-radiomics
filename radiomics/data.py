@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 
 from .config import DATA_CSV, DATA_CSV_EMB, LABELS_CSV, FEATURE_PREFIXES, DIAGNOSIS_MAP
@@ -34,7 +35,7 @@ class DataLoader:
             emb[col]    = emb[col].astype(str)
             labels[col] = labels[col].astype(str)
 
-        outcome_cols = ["ID", "tissue", "Diagnosis", "BRAF p/n", "BRAF_2nd",
+        outcome_cols = ["ID", "PID", "tissue", "Diagnosis", "BRAF p/n", "BRAF_2nd",
                         "Relapse p/n", "RAS", "TERT", "malignancy"]
         outcome_cols = [c for c in outcome_cols if c in labels.columns]
 
@@ -76,7 +77,13 @@ class DataLoader:
         )
 
         meta["batch"]      = meta["TMA"].astype(str) + "_" + meta["Grid"].astype(str)
-        meta["patient_id"] = meta["ID"].fillna(-1).astype(int) if "ID" in meta.columns else -1
+        mask_missing = meta["PID"].isna()
+        if mask_missing.any():
+            next_id = int(meta["PID"].max() + 1) if not meta["PID"].isna().all() else 0
+            meta.loc[mask_missing, "PID"] = np.arange(next_id, next_id + mask_missing.sum())
+            print(f"  {mask_missing.sum()} samples had no PID — assigned synthetic unique PIDs")
+
+        meta["patient_id"] = meta["PID"].astype(int)
 
         for col in ["BRAF p/n", "BRAF_2nd", "Relapse p/n", "RAS", "TERT"]:
             if col in meta.columns:

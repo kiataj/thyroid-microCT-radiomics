@@ -5,7 +5,8 @@ import numpy as np
 import pandas as pd
 from scipy.spatial.distance import jensenshannon
 from sklearn.metrics import (
-    accuracy_score, f1_score, precision_score, recall_score, roc_auc_score,
+    accuracy_score, average_precision_score, f1_score,
+    precision_score, recall_score, roc_auc_score,
 )
 
 
@@ -15,6 +16,7 @@ def compute_fold_metrics(y_true: np.ndarray, y_prob: np.ndarray,
     preds = (y_prob >= threshold).astype(int)
     row = {
         "val_auc":       roc_auc_score(y_true, y_prob),
+        "val_auprc":     average_precision_score(y_true, y_prob),
         "val_accuracy":  accuracy_score(y_true, preds),
         "val_f1":        f1_score(y_true, preds, average="weighted", zero_division=0),
         "val_precision": precision_score(y_true, preds, average="weighted", zero_division=0),
@@ -23,11 +25,13 @@ def compute_fold_metrics(y_true: np.ndarray, y_prob: np.ndarray,
     if y_true_train is not None and y_prob_train is not None:
         tr_preds = (y_prob_train >= threshold).astype(int)
         row["train_auc"]       = roc_auc_score(y_true_train, y_prob_train)
+        row["train_auprc"]     = average_precision_score(y_true_train, y_prob_train)
         row["train_accuracy"]  = accuracy_score(y_true_train, tr_preds)
         row["train_f1"]        = f1_score(y_true_train, tr_preds, average="weighted", zero_division=0)
         row["train_precision"] = precision_score(y_true_train, tr_preds, average="weighted", zero_division=0)
         row["train_recall"]    = recall_score(y_true_train, tr_preds, average="weighted", zero_division=0)
         row["auc_gap"]         = row["train_auc"] - row["val_auc"]
+        row["auprc_gap"]       = row["train_auprc"] - row["val_auprc"]
     if fold is not None:
         row["fold"] = fold
     return row
@@ -39,7 +43,7 @@ def bootstrap_ci(probs: np.ndarray, targets: np.ndarray,
     rng   = np.random.default_rng(seed)
     n     = len(targets)
     stats: dict[str, list] = {
-        "auc": [], "accuracy": [], "f1": [], "precision": [], "recall": []
+        "auc": [], "auprc": [], "accuracy": [], "f1": [], "precision": [], "recall": []
     }
     for _ in range(n_boot):
         idx   = rng.integers(0, n, size=n)
@@ -48,6 +52,7 @@ def bootstrap_ci(probs: np.ndarray, targets: np.ndarray,
             continue
         preds = (p >= threshold).astype(int)
         stats["auc"].append(roc_auc_score(t, p))
+        stats["auprc"].append(average_precision_score(t, p))
         stats["accuracy"].append(accuracy_score(t, preds))
         stats["f1"].append(f1_score(t, preds, average="weighted", zero_division=0))
         stats["precision"].append(precision_score(t, preds, average="weighted", zero_division=0))
