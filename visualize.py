@@ -186,7 +186,10 @@ def plot_prob_dist(task_name, task_dir):
                     label=class_labels[cls], edgecolor="none")
         ax.set_ylabel("Frequency")
     ax.set_xlabel("Predicted probability")
-    ax.legend(fontsize=9)
+    if task_name == "tumor_type_ftn_vs_ptc":
+        ax.legend(fontsize=9, loc="upper left")
+    else:
+        ax.legend(fontsize=9)
     ax.set_xlim(0, 1)
     ax.set_ylim(bottom=0)
     fig.tight_layout()
@@ -227,6 +230,7 @@ def plot_shap(task_name, task_dir):
         ax.xaxis.label.set_size(FONT_SIZE)
         ax.yaxis.label.set_size(FONT_SIZE)
     plt.gca().set_xlabel("SHAP value")
+    plt.gcf().axes[0].set_title("")
     if task_name == "braf_v600e":
         plt.gca().set_xlim(-1, 1)
     plt.tight_layout()

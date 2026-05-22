@@ -21,14 +21,129 @@ from radiomics.preprocessing import (icc_filter, pearson_redundancy_reduction,
 PEARSON_THRESHOLD = 0.75
 
 
+def run_fvptc_similarity(features: pd.DataFrame, meta: pd.DataFrame, mask_valid) -> None:
+    import json
+    import torch
+    import torch.optim as optim
+    import torch.nn as nn
+    import matplotlib.pyplot as plt
+    from scipy.stats import gaussian_kde
+    from scipy.spatial.distance import jensenshannon
+    from skorch import NeuralNetClassifier
+    from skorch.callbacks import LRScheduler
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.pipeline import Pipeline
+    from radiomics.mlp import MLP
+
+    out_dir = RESULTS_DIR / "fvptc_similarity"
+    out_dir.mkdir(exist_ok=True)
+
+    mask_train = (mask_valid
+                  & (meta["tissue"] == "Tu")
+                  & meta["diagnosis_class"].isin([0, 1]))
+    mask_fvptc = (mask_valid
+                  & (meta["tissue"] == "Tu")
+                  & ((meta["diagnosis_class"] == 4) | meta["is_fvptc"]))
+
+    X_train = features.loc[mask_train].values.astype(np.float32)
+    y_train = meta.loc[mask_train, "diagnosis_class"].astype(int).values
+    X_fvptc = features.loc[mask_fvptc].values.astype(np.float32)
+
+    n_ptc   = int((y_train == 0).sum())
+    n_ftn   = int((y_train == 1).sum())
+    n_fvptc = len(X_fvptc)
+    print(f"\nFVPTC similarity: {n_ptc} PTC + {n_ftn} FTN (train), {n_fvptc} FVPTC (test)")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    net = NeuralNetClassifier(
+        module=MLP,
+        module__input_dim=X_train.shape[1],
+        module__hidden_dims=(256, 128, 256),
+        module__output_dim=2,
+        module__dropout_rate=0.5,
+        max_epochs=100,
+        batch_size=32,
+        optimizer=optim.Adam,
+        optimizer__lr=1e-3,
+        optimizer__weight_decay=1e-3,
+        criterion=nn.CrossEntropyLoss,
+        device=device,
+        callbacks=[("lr_scheduler", LRScheduler(policy="ExponentialLR", gamma=0.9))],
+        train_split=None,
+        verbose=0,
+    )
+    clf = Pipeline([("scaler", StandardScaler()), ("net", net)])
+    clf.fit(X_train, y_train)
+
+    # class 0 = PTC, class 1 = FTN — column 0 is P(PTC)
+    prob_ptc_fvptc = clf.predict_proba(X_fvptc)[:, 0]
+    prob_ptc_train = clf.predict_proba(X_train)[:, 0]
+    prob_ptc_ptc   = prob_ptc_train[y_train == 0]
+    prob_ptc_ftn   = prob_ptc_train[y_train == 1]
+
+    mean_p   = float(prob_ptc_fvptc.mean())
+    median_p = float(np.median(prob_ptc_fvptc))
+    std_p    = float(prob_ptc_fvptc.std())
+
+    # JSD between FVPTC and each reference class (histogram, 20 bins, consistent with evaluation.py)
+    bin_edges = np.linspace(0, 1, 21)
+
+    def _hist(vals):
+        counts, _ = np.histogram(vals, bins=bin_edges, density=False)
+        counts = counts.astype(float)
+        total = counts.sum()
+        return counts / total if total > 0 else counts + 1e-10
+
+    h_fvptc = _hist(prob_ptc_fvptc)
+    h_ptc   = _hist(prob_ptc_ptc)
+    h_ftn   = _hist(prob_ptc_ftn)
+
+    jsd_vs_ptc = float(jensenshannon(h_fvptc, h_ptc, base=2) ** 2)
+    jsd_vs_ftn = float(jensenshannon(h_fvptc, h_ftn, base=2) ** 2)
+
+    print(f"  FVPTC P(PTC): mean={mean_p:.3f}  median={median_p:.3f}  std={std_p:.3f}")
+    print(f"  JSD(FVPTC vs PTC)={jsd_vs_ptc:.4f}  JSD(FVPTC vs FTN)={jsd_vs_ftn:.4f}")
+    closer = "PTC" if jsd_vs_ptc < jsd_vs_ftn else "FTN"
+    print(f"  FVPTC is distributionally closer to {closer}")
+
+    pd.DataFrame({"prob_ptc": prob_ptc_fvptc}).to_csv(
+        out_dir / "fvptc_similarity_probabilities.csv", index=False)
+
+    summary = {
+        "n_fvptc": n_fvptc, "n_ptc_train": n_ptc, "n_ftn_train": n_ftn,
+        "mean_prob_ptc": mean_p, "median_prob_ptc": median_p, "std_prob_ptc": std_p,
+        "jsd_fvptc_vs_ptc": jsd_vs_ptc,
+        "jsd_fvptc_vs_ftn": jsd_vs_ftn,
+        "closer_to": closer,
+    }
+    (out_dir / "fvptc_similarity_summary.json").write_text(json.dumps(summary, indent=2))
+
+    x_grid = np.linspace(0, 1, 300)
+    fig, ax = plt.subplots(figsize=(6, 4))
+    for vals, label, color in [
+        (prob_ptc_ptc,   "PTC (train)",  "#2166ac"),
+        (prob_ptc_ftn,   "FTN (train)",  "#d73027"),
+        (prob_ptc_fvptc, "FVPTC (test)", "#4dac26"),
+    ]:
+        kde = gaussian_kde(vals, bw_method="scott")
+        ax.plot(x_grid, kde(x_grid), label=label, color=color, lw=2)
+        ax.axvline(float(vals.mean()), color=color, lw=1, linestyle="--", alpha=0.7)
+    ax.set_xlabel("Predicted probability of PTC")
+    ax.set_ylabel("Density")
+    ax.set_xlim(0, 1)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_dir / "fvptc_similarity_kde.png", dpi=150)
+    plt.close(fig)
+    print(f"  Results saved to {out_dir}")
+
+
 def run_tert_mwu(features: pd.DataFrame, meta: pd.DataFrame, mask_valid) -> None:
     mask = (mask_valid
             & (meta["tissue"] == "Tu")
             & meta["TERT"].isin([0, 1]))
     X    = features.loc[mask].reset_index(drop=True)
     y    = meta.loc[mask, "TERT"].astype(int).values
-
-    X = pearson_redundancy_reduction(X, threshold=PEARSON_THRESHOLD)
 
     n_mut = (y == 1).sum()
     n_wt  = (y == 0).sum()
@@ -46,7 +161,7 @@ def run_tert_mwu(features: pd.DataFrame, meta: pd.DataFrame, mask_valid) -> None
     reject, p_fdr, _, _ = multipletests(df["p_value"].values, method="fdr_bh")
     df["p_value_fdr"] = p_fdr
     df["significant_fdr05"] = reject
-    df = df.sort_values("p_value_fdr").reset_index(drop=True)
+    df = df.sort_values("p_value").reset_index(drop=True)
 
     out_dir = RESULTS_DIR / "tert_mwu"
     out_dir.mkdir(exist_ok=True)
@@ -69,10 +184,11 @@ def main():
     parser.add_argument("--task-2", action="store_true")
     parser.add_argument("--task-3", action="store_true")
     parser.add_argument("--tert",   action="store_true")
+    parser.add_argument("--fvptc",  action="store_true")
     parser.add_argument("--shap",   action="store_true")
     args = parser.parse_args()
 
-    selected = [args.task_1, args.task_2, args.task_3, args.tert]
+    selected = [args.task_1, args.task_2, args.task_3, args.tert, args.fvptc]
     run_all  = not any(selected)
     main_only = not run_all
 
@@ -140,8 +256,7 @@ def main():
 
     mask_valid = ~meta["patient_id"].isin(EXCLUDED_IDS)
 
-    # Combined BRAF label: mutant if either BRAF p/n or BRAF_2nd is 1 (OR logic)
-    meta["braf_label"] = meta[["BRAF p/n", "BRAF_2nd"]].max(axis=1)
+    meta["braf_label"] = meta["BRAF p/n"]
 
     runner = TaskRunner(results_dir=RESULTS_DIR)
 
@@ -207,6 +322,9 @@ def main():
     # -------------------------------------------------------------------------
     if (run_all or args.tert) and "TERT" in meta.columns:
         run_tert_mwu(features, meta, mask_valid)
+
+    if run_all or args.fvptc:
+        run_fvptc_similarity(features, meta, mask_valid)
 
     print(f"\nDone. Results saved to {RESULTS_DIR}")
 
