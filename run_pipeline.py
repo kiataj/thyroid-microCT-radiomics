@@ -302,7 +302,7 @@ def main():
     # -------------------------------------------------------------------------
     if run_all or args.task_3:
         cfg  = TaskConfig(name="braf_v600e",
-                          class_labels={0: "BRAF wild-type", 1: "BRAF mutant"},
+                          class_labels={0: "BRAF V600E wild-type", 1: "BRAF V600E mutant"},
                           class_weights=[1, 2],
                           stratified=True,
                           hidden_dims=(256,128,256), num_epochs=100, batch_size=16,

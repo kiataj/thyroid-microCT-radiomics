@@ -162,6 +162,8 @@ def plot_prob_dist(task_name, task_dir):
     df   = pd.read_csv(probs_path)
     meta = load_json(meta_path)
     class_labels = {int(k): v for k, v in meta["class_labels"].items()}
+    if task_name == "braf_v600e":
+        class_labels = {0: "BRAF V600E wild-type", 1: "BRAF V600E mutant"}
 
     fig, ax = plt.subplots(figsize=PANEL_FIGSIZE)
     if PROB_DIST_KDE:
